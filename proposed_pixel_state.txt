@@ -1,0 +1,24 @@
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+import numpy as np
+from wavebrain.statedecode import interior_pool
+from wavebrain.randstudy import rand_arm_config
+from wavebrain.randshapes import trial_shapes, draw_offsets
+from wavebrain.decode import position_targets, shape_targets, shape_basis, make_regressor, squared_errors, r2_from_errors
+cfg = rand_arm_config("FULL", 1000, 120); m = cfg.base.medium; b = cfg.base
+def written_map(i):
+    grid = np.zeros((m.ny, m.nx))
+    for pat, (dy, dx), cy in zip(trial_shapes(cfg, i), draw_offsets(cfg, i), cfg.centres):
+        y0 = cy - b.pattern_size // 2 + int(dy); x0 = m.nx // 2 - b.pattern_size // 2 + int(dx)
+        grid[y0:y0 + b.pattern_size, x0:x0 + b.pattern_size] += pat
+    return interior_pool(grid, m.sponge_width)
+M = np.stack([written_map(i) for i in range(120)])
+P, Y = position_targets(cfg), shape_targets(cfg, shape_basis())
+r2 = lambda X, T, r: r2_from_errors(squared_errors(X, T, make_regressor(r), 5, 2, 0), T)
+print("written-intensity map, pooled to 361 values (known to encode shape and placement):")
+for r in ("linear", "rbf"):
+    print(f"  {r:6s} position R2 {r2(M,P,r):+.2f}   shape R2 {r2(M,Y,r):+.2f}")
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"written-intensity map, pooled to 361 values (known to encode shape and placement):\n  linear position R2 +0.35   shape R2 +0.03\n  rbf    position R2 +0.36   shape R2 +0.14\n","stderr":""}
