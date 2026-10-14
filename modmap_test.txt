@@ -1,0 +1,274 @@
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+def sub(s, old, new):
+    assert old in s, f"missing: {old[:70]}"
+    return s.replace(old, new, 1)
+p='wavebrain/modmap.py'; s=open(p).read()
+s=sub(s,'''       PROBE_EXPLAINED          |m - p| < BAND: the probe gets what the modulation map holds.
+       PROBE_BEATS_MODULATION   m <= p - BAND: the probe recovers more than the map holds: it uses other
+                                channels, and the first-order picture is incomplete.''','''       PROBE_EXPLAINED          p - BAND <= m < p + BAND: the probe gets what the modulation map holds.
+       PROBE_BEATS_MODULATION   m < p - BAND: the probe recovers more than the map holds: it uses other
+                                channels, and the first-order picture is incomplete.''')
+open(p,'w').write(s)
+
+open('tests/test_modmap.py','w').write('''"""Tests for the modulation-map decoding (state arrays, amplitude-aware noise, probe comparison)."""
+import json
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+import wavebrain.modmap as mm
+from wavebrain.decode import make_regressor, r2_from_errors, squared_errors
+from wavebrain.modmap import (BASE_NOISE, STATES, add_noise, best, build_features, format_report, main, run_modmap, verdict)
+from wavebrain.randstudy import rand_arm_config
+from wavebrain.statedecode import get_state_arrays
+
+
+# ------------------------------------------------------------------ features
+def _arrays(seed=0, n=10):
+    rng = np.random.default_rng(seed)
+    full = {"H": rng.normal(size=(n, 361)), "u": rng.normal(size=(n, 361)), "s": rng.normal(size=(n, 361))}
+    ring = {"H": np.zeros((n, 361)), "u": rng.normal(size=(n, 361)), "s": rng.normal(size=(n, 361))}
+    return full, ring
+
+
+def test_modulation_maps_use_the_medium_coefficients_and_the_right_arms():
+    full, ring = _arrays()
+    med = rand_arm_config("FULL", 0, 24).base.medium
+    f = build_features(full, ring, med)
+    assert (med.slow_mod, med.holo_mod) == (0.3, 0.5)
+    np.testing.assert_allclose(f["mod"], 0.3 * full["s"] + 0.5 * full["H"])
+    np.testing.assert_allclose(f["mod_s"], 0.3 * full["s"]); np.testing.assert_allclose(f["mod_H"], 0.5 * full["H"])
+    np.testing.assert_allclose(f["mod_ring"], 0.3 * ring["s"])                      # hologram-off arm: slow field only
+    np.testing.assert_array_equal(f["u_full"], full["u"]); np.testing.assert_array_equal(f["u_ring"], ring["u"])
+    assert not f["NULL"].any() and set(f) == set(STATES) | {"NULL"}
+    f2 = build_features(full, ring, replace(med, slow_mod=0.1, holo_mod=0.2))        # follows the configuration
+    np.testing.assert_allclose(f2["mod"], 0.1 * full["s"] + 0.2 * full["H"])
+
+
+# ------------------------------------------------------------------- noise
+def test_add_noise_scaling_sharing_and_reproducibility():
+    X = np.zeros((200, 361))
+    assert add_noise(X, 0.0, 3, 0) is X                                              # no noise at multiplier 0
+    n1, n4 = add_noise(X, 1.0, 3, 1), add_noise(X, 4.0, 3, 1)
+    assert n1.std() == pytest.approx(BASE_NOISE, rel=0.05) and n4.std() / n1.std() == pytest.approx(4.0, rel=1e-9)
+    np.testing.assert_array_equal(n1, add_noise(X, 1.0, 3, 1))                       # reproducible
+    other = np.random.default_rng(0).normal(size=X.shape)
+    np.testing.assert_allclose(add_noise(other, 1.0, 3, 1) - other, n1)               # SAME realisation for every state
+    assert not np.allclose(n1, add_noise(X, 1.0, 3, 2)) and not np.allclose(n1, add_noise(X, 1.0, 4, 1))
+    assert np.abs(n1).max() > 0                                                        # the NULL features really carry noise
+
+
+def test_r2_is_invariant_to_rescaling_the_features_which_justifies_the_reproduction_check():
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(80, 30)); Y = X[:, :3] @ rng.normal(size=(3, 4)) + 0.3 * rng.normal(size=(80, 4))
+    for r in ("linear", "rbf"):
+        a = r2_from_errors(squared_errors(X, Y, make_regressor(r)), Y)
+        b = r2_from_errors(squared_errors(0.37 * X, Y, make_regressor(r)), Y)
+        assert a == pytest.approx(b, abs=1e-9)
+
+
+# ----------------------------------------------------------------- verdict
+def _cell(r2, lo=0.05):
+    return {"r2": r2, "r2_lo": r2 - 0.05, "r2_hi": r2 + 0.05, "diff_vs_null": {"diff": r2, "lo": lo, "hi": r2 + 0.1}}
+
+
+def _entry(pool, sub, lo=0.05):
+    return {"pool4": {r: _cell(pool, lo) for r in ("linear", "rbf")}, "sub24": {r: _cell(sub, lo) for r in ("linear", "rbf")}}
+
+
+def _sres(m=0.6, m_sub=0.5, p=0.22, s=0.5, h=0.1, u=0.3, null=-0.01, pc=0.999, mp=0.4, lo=0.05, clip=0.0,
+          probe="given", drop=()):
+    mults = ("0.0", "1.0", "4.0")
+    st = {"mod": {k: _entry(m, m_sub, lo) for k in mults}, "mod_s": {k: _entry(s, s, lo) for k in mults},
+          "mod_H": {k: _entry(h, h, lo) for k in mults}, "mod_ring": {k: _entry(s, s, lo) for k in mults},
+          "u_full": {k: _entry(u, u, lo) for k in mults}, "u_ring": {k: _entry(u, u, lo) for k in mults},
+          "NULL": {k: _entry(null, null) for k in mults}}
+    for d in drop:
+        st.pop(d)
+    return {"states": st, "clip_events": clip, "probe_r2": p if probe == "given" else None,
+            "baselines": {"fft_concat": {"shape": {"linear": {"r2": pc}}}, "map": {"position": {"linear": {"r2": mp}}}}}
+
+
+def test_verdict_invalid_inconclusive_and_the_three_controls():
+    assert verdict(_sres(clip=3.0))["outcome"] == "INVALID_CLIPPED"
+    assert verdict(_sres(drop=("NULL",)))["outcome"] == "INCONCLUSIVE"
+    assert verdict(_sres(pc=0.5))["outcome"] == "POSITIVE_CONTROL_FAILS"
+    leaky = _sres(); leaky["states"]["NULL"]["16.0"] = _entry(0.3, -0.01) if "16.0" in leaky["states"]["NULL"] else None
+    leaky["states"]["NULL"]["4.0"] = _entry(0.2, -0.01)                                # a leak at ANY noise level counts
+    assert verdict(leaky)["outcome"] == "CONTROL_FAILS"
+    assert verdict(_sres(null=0.04))["outcome"] != "CONTROL_FAILS"
+    assert verdict(_sres(mp=0.1))["outcome"] == "STATE_CONTROL_FAILS"
+    assert verdict(_sres(mp=0.26))["outcome"] != "STATE_CONTROL_FAILS"
+
+
+def test_verdict_classifies_the_probe_against_the_modulation_map():
+    assert verdict(_sres(m=0.6, m_sub=0.5, p=0.22))["outcome"] == "PROBE_PATH_LOSSY"            # even 24 values beat the probe
+    assert verdict(_sres(m=0.6, m_sub=0.25, p=0.22))["outcome"] == "BANDWIDTH_LIMITED"          # only the full map does
+    assert verdict(_sres(m=0.25, m_sub=0.2, p=0.22))["outcome"] == "PROBE_EXPLAINED"
+    assert verdict(_sres(m=0.15, m_sub=0.1, p=0.35))["outcome"] == "PROBE_BEATS_MODULATION"
+    assert verdict(_sres(m=0.311, m_sub=0.311, p=0.2))["outcome"] == "PROBE_PATH_LOSSY"         # just above p + band
+    assert verdict(_sres(m=0.299, m_sub=0.299, p=0.2))["outcome"] == "PROBE_EXPLAINED"          # just below
+    assert verdict(_sres(m=0.101, m_sub=0.101, p=0.2))["outcome"] == "PROBE_EXPLAINED"          # just inside the lower band
+    assert verdict(_sres(m=0.099, m_sub=0.099, p=0.2))["outcome"] == "PROBE_BEATS_MODULATION"   # just below it
+    r = verdict(_sres(probe=None))
+    assert r["outcome"] == "NO_PROBE_REFERENCE" and "channel" in r
+
+
+def test_verdict_counts_a_map_only_if_its_interval_versus_null_is_above_zero_and_reports_qualifiers():
+    assert best(_sres(m=0.6), "mod", "1.0", "pool4") == (0.6, "linear")
+    assert best(_sres(m=0.6, lo=-0.01), "mod", "1.0", "pool4")[0] == 0.0
+    assert verdict(_sres(m=0.6, m_sub=0.6, lo=-0.01))["outcome"] == "PROBE_BEATS_MODULATION"    # map not distinguishable from NULL
+    assert verdict(_sres(s=0.5, h=0.5))["channel"] == "both"
+    assert verdict(_sres(s=0.5, h=0.05))["channel"] == "slow"
+    assert verdict(_sres(s=0.05, h=0.5))["channel"] == "hologram"
+    assert verdict(_sres(s=0.05, h=0.05))["channel"] == "neither"
+    assert verdict(_sres(u=0.3))["fast"] == "fast-visible" and verdict(_sres(u=0.05))["fast"] == "fast-buried"
+
+
+def test_verdict_can_be_evaluated_at_another_noise_level():
+    s = _sres(m=0.6, m_sub=0.5, p=0.22)
+    s["states"]["mod"]["4.0"] = _entry(0.25, 0.2)
+    assert verdict(s, "1.0")["outcome"] == "PROBE_PATH_LOSSY" and verdict(s, "4.0")["outcome"] == "PROBE_EXPLAINED"
+
+
+# ------------------------------------------------------------------ end to end
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    cache = tmp_path_factory.mktemp("mcache")
+    kw = dict(n_trials=24, seeds=(3,), noise_mults=(0.0, 1.0), cache_dir=cache, probe_r2=0.2, n_boot=50, k=4, repeats=2,
+              verbose=False)
+    return run_modmap(**kw), kw, cache
+
+
+def test_run_modmap_structure_null_and_scale_invariance_against_direct_computation(tiny):
+    res, kw, cache = tiny
+    s = res["seeds"][3]
+    assert set(s["states"]) == set(STATES) | {"NULL"} and set(s["states"]["mod"]) == {"0.0", "1.0"}
+    for m in ("0.0", "1.0"):
+        for v in ("pool4", "sub24"):
+            for r in ("linear", "rbf"):
+                assert s["states"]["NULL"][m][v][r]["r2"] < 0.2
+    full, _ = get_state_arrays("FULL", 3, 24, cache)
+    Y = __import__("wavebrain.decode", fromlist=["x"]).shape_targets(rand_arm_config("FULL", 3, 24), __import__("wavebrain.decode", fromlist=["x"]).shape_basis())
+    for r in ("linear", "rbf"):
+        direct = r2_from_errors(squared_errors(full["H"], Y, make_regressor(r), 4, 2, 3), Y)
+        assert s["states"]["mod_H"]["0.0"]["pool4"][r]["r2"] == pytest.approx(direct, abs=1e-9)     # 0.5 * H decodes like H
+    assert s["family_level"] == pytest.approx(1 - 0.05 / 12) and s["probe_r2"] == 0.2
+    assert set(s["verdict_at"]) == {"1.0"} and res["combined"]["outcome"] == s["verdict"]["outcome"]
+
+
+def test_reproduction_check_against_a_statedecode_json(tiny, tmp_path):
+    res, kw, cache = tiny
+    from wavebrain.decode import shape_basis, shape_targets
+    cfg = rand_arm_config("FULL", 3, 24); Y = shape_targets(cfg, shape_basis())
+    full, _ = get_state_arrays("FULL", 3, 24, cache); ring, _ = get_state_arrays("RING_ONLY", 3, 24, cache)
+    r2 = lambda X, r: r2_from_errors(squared_errors(X, Y, make_regressor(r), 4, 2, 3), Y)
+    ref = {name: {"pool4": {"shape": {r: {"r2": r2(X, r)} for r in ("linear", "rbf")}}}
+           for name, X in (("H", full["H"]), ("s_full", full["s"]), ("u_full", full["u"]), ("u_ring", ring["u"]))}
+    pj = tmp_path / "state.json"; pj.write_text(json.dumps({"seeds": {"3": {"states": ref}}}))
+    out = run_modmap(**{**kw, "statedecode_json": str(pj)})
+    assert set(out["seeds"][3]["reproduction"]) == {"mod_H", "mod_s", "u_full", "u_ring"}
+    assert all(d < 1e-9 for d in out["seeds"][3]["reproduction"].values())
+
+
+def test_paired_comparison_uses_the_family_level(tiny, monkeypatch):
+    res, kw, cache = tiny
+    seen = []
+    real = mm.bootstrap_r2
+
+    def spy(E_a, Y, E_b=None, n_boot=2000, seed=0, level=0.95):
+        seen.append((E_b is not None, level))
+        return real(E_a, Y, E_b, n_boot, seed, level)
+
+    monkeypatch.setattr(mm, "bootstrap_r2", spy)
+    run_modmap(**kw)
+    levels = [lv for paired, lv in seen if paired]
+    assert levels and all(lv == pytest.approx(1 - 0.05 / 12) for lv in levels)
+
+
+def test_report_and_cli(tiny, tmp_path):
+    res, kw, cache = tiny
+    text = format_report(res)
+    for needle in ("VERDICT (seed 3", "controls:", "probe readout (v10)", "outcome at other noise levels", "COMBINED", "mod_ring x1.0"):
+        assert needle in text
+    out = tmp_path / "m.json"
+    assert main(["--trials", "24", "--seeds", "3", "--cache", str(cache), "--probe-r2", "0.2", "--boot", "50", "--json", str(out)]) == 0
+    data = json.loads(out.read_text())
+    assert data["seeds"]["3"]["probe_r2"] == pytest.approx(0.2) and "_correct" not in out.read_text()
+''')
+
+p='mutation_check.py'; s=open(p).read()
+entries='''
+
+MODMAP_MUTATIONS = [
+    ("modulation coefficients swapped",
+     "wavebrain/modmap.py",
+     'return {"mod": sm * full["s"] + hm * full["H"]', 'return {"mod": hm * full["s"] + sm * full["H"]',
+     "tests/test_modmap.py", "modulation_maps_use"),
+    ("hologram-off modulation built from H instead of the slow field",
+     "wavebrain/modmap.py",
+     '"mod_ring": sm * ring["s"]', '"mod_ring": sm * ring["H"]',
+     "tests/test_modmap.py", "modulation_maps_use"),
+    ("noise realisation differs between states",
+     "wavebrain/modmap.py",
+     "np.random.default_rng([seed, 99, idx]).normal(size=X.shape)", "np.random.default_rng([seed, 99, idx, int(abs(X.sum()) * 1000) % 997]).normal(size=X.shape)",
+     "tests/test_modmap.py", "add_noise"),
+    ("noise multiplier ignored",
+     "wavebrain/modmap.py",
+     "BASE_NOISE * mult * np.random", "BASE_NOISE * np.random",
+     "tests/test_modmap.py", "add_noise"),
+    ("NULL gets no noise",
+     "wavebrain/modmap.py",
+     "    if mult == 0.0:\\n        return X", "    if mult == 0.0 or not X.any():\\n        return X",
+     "tests/test_modmap.py", "add_noise"),
+    ("path-lossy test uses the full map instead of 24 values",
+     "wavebrain/modmap.py",
+     "    if m_sub >= p + BAND:", "    if m >= p + BAND:",
+     "tests/test_modmap.py", "classifies_the_probe"),
+    ("paired interval ignored for the map",
+     "wavebrain/modmap.py",
+     'return (c["r2"] if c["diff_vs_null"]["lo"] > 0 else 0.0), r', 'return (c["r2"] if c["diff_vs_null"]["hi"] > 0 else 0.0), r',
+     "tests/test_modmap.py", "interval_versus_null"),
+    ("NULL leak rule disabled",
+     "wavebrain/modmap.py",
+     "    if leaks:\\n", "    if False:\\n",
+     "tests/test_modmap.py", "three_controls"),
+    ("missing probe reference not handled",
+     "wavebrain/modmap.py",
+     "    if p is None:", "    if False:",
+     "tests/test_modmap.py", "classifies_the_probe"),
+    ("Bonferroni family level dropped",
+     "wavebrain/modmap.py",
+     "level = 1.0 - 0.05 / (len(STATES) * len(readouts))", "level = 0.95",
+     "tests/test_modmap.py", "family_level or structure_null"),
+    ("channel qualifier mislabels the slow field",
+     "wavebrain/modmap.py",
+     'else "slow" if s_r >= MIN_R2', 'else "hologram" if s_r >= MIN_R2' if False else 'else "hologram" if s_r >= MIN_R2',
+     "tests/test_modmap.py", "reports_qualifiers"),
+    ("state control disabled",
+     "wavebrain/modmap.py",
+     "    if mp < STATE_CONTROL_MIN:", "    if False:",
+     "tests/test_modmap.py", "three_controls"),
+]
+'''
+marker="\\n\\ndef run_group(entries) -> int:"
+marker="\n\ndef run_group(entries) -> int:"
+s=s.replace(marker, entries+marker,1)
+s=s.replace('"noise", "state", "all"]','"noise", "state", "modmap", "all"]')
+s=s.replace('''    if a.group in ("state", "all"):
+        print("== state-decoding defects ==")
+        missed += run_group(STATE_MUTATIONS)''','''    if a.group in ("state", "all"):
+        print("== state-decoding defects ==")
+        missed += run_group(STATE_MUTATIONS)
+    if a.group in ("modmap", "all"):
+        print("== modulation-map defects ==")
+        missed += run_group(MODMAP_MUTATIONS)''')
+s=s.replace("noise|state|all]","noise|state|modmap|all]")
+open(p,'w').write(s)
+EOF
+python3 -c "import mutation_check as m; print('modmap mutations:', len(m.MODMAP_MUTATIONS))"; python3 -m pytest tests/test_modmap.py 2>&1 | tail -12
+
+Response:
+
+{"returncode":0,"stdout":"modmap mutations: 12\n        if pc < POSITIVE_CONTROL_R2:\n            return {\"outcome\": \"POSITIVE_CONTROL_FAILS\",\n                    \"text\": f\"Fourier features decode the descriptors with R2 = {pc:.3f} < {POSITIVE_CONTROL_R2}.\",\n                    \"next\": \"Fix the target construction first.\"}\n>       leaks = [(m, v, r) for m in st[\"NULL\"] for v in VARIANTS for r, c in st[\"NULL\"][m][v].items() if c[\"r2\"] > 0.05]\n                                                                             ^^^^^^^^^^^^^^^^\nE       TypeError: 'NoneType' object is not subscriptable\n\nwavebrain/modmap.py:107: TypeError\n=========================== short test summary info ============================\nFAILED tests/test_modmap.py::test_verdict_invalid_inconclusive_and_the_three_controls\n1 failed, 10 passed in 13.25s\n","stderr":""}
