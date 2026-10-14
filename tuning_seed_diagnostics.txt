@@ -1,0 +1,47 @@
+bash
+
+cd /home/squire/wavebrain_project; sed -i 's/X2 = rng.normal(size=(200, 6)); Y2 = np.sin/X2 = rng.normal(size=(200, 3)); Y2 = np.sin/; s/assert r_lin < 0.2 and r_rbf > 0.6/assert r_lin < 0.2 and r_rbf > 0.7/' tests/test_decode.py
+python3 -m pytest tests/test_decode.py 2>&1 | tail -6
+python3 -m wavebrain.decode --trials 120 --seeds 1000 --cache /tmp/cache_rand_tune4 --boot 500 2>&1 | sed -n '/^WaveBrain shape/,$p' | cut -c1-175
+Output
+
+E       TypeError: unhashable type: 'ApproxScalar'
+
+tests/test_decode.py:215: TypeError
+=========================== short test summary info ============================
+FAILED tests/test_decode.py::test_paired_comparison_uses_the_family_level - T...
+1 failed, 15 passed in 16.10s
+WaveBrain shape-decoding diagnostic (trials=120, seeds=[1000], 4 descriptors per shape explaining 58% of descriptor variance, min R2 0.1)
+
+=== seed 1000, noise x1.0: cross-validated R2 [95% CI]; diff = R2 - R2(NULL) [adj. CI] ===
+features                              shape/linear                 shape/rbf           position/linear              position/rbf
+--------------------------------------------------------------------------------------------------------------------------------
+FULL                           +0.15 [+0.10,+0.19]       +0.15 [+0.11,+0.19]       -0.06 [-0.10,-0.02]       -0.02 [-0.03,-0.02]
+RING_ONLY                      +0.16 [+0.11,+0.20]       +0.17 [+0.12,+0.20]       -0.05 [-0.12,+0.00]       -0.05 [-0.06,-0.03]
+HOLO_ONLY                      -0.02 [-0.06,+0.02]       -0.00 [-0.02,+0.02]       -0.05 [-0.08,-0.01]       -0.02 [-0.02,-0.01]
+NULL                           -0.09 [-0.12,-0.06]       -0.02 [-0.03,-0.02]       -0.04 [-0.07,-0.01]       -0.02 [-0.02,-0.01]
+fft_concat (engineered)        +1.00 [+1.00,+1.00]       +1.00 [+1.00,+1.00]       -3.10 [-3.74,-2.52]       -0.02 [-0.02,-0.01]
+pooled (engineered)            +0.03 [+0.00,+0.05]       +0.14 [+0.10,+0.18]       +0.36 [+0.30,+0.42]       +0.35 [+0.29,+0.42]
+raw (engineered)               -2.33 [-2.88,-1.93]       +0.12 [+0.08,+0.15]       -0.89 [-1.16,-0.63]       +0.33 [+0.27,+0.39]
+
+gain over NULL, shape, base noise [adjusted CI]:
+  FULL      linear +0.236 [+0.180,+0.291]  rbf +0.172 [+0.112,+0.228]
+  RING_ONLY linear +0.248 [+0.198,+0.300]  rbf +0.189 [+0.131,+0.244]
+  HOLO_ONLY linear +0.072 [+0.034,+0.118]  rbf +0.023 [-0.002,+0.044]
+
+noise sweep, shape R2 (readout: linear/rbf):
+arm                        x0.25                x1.0                x4.0
+FULL                +0.34  +0.34        +0.15  +0.15        +0.03  +0.05
+RING_ONLY           +0.25  +0.32        +0.16  +0.17        +0.05  +0.07
+HOLO_ONLY           +0.04  +0.06        -0.02  -0.00        -0.07  -0.02
+NULL                -0.09  -0.02        -0.09  -0.02        -0.09  -0.02
+
+FULL/linear shape R2 per descriptor (top PC1..4, bottom PC1..4): +0.37 +0.22 +0.15 -0.10 +0.28 +0.25 +0.17 -0.17
+
+VERDICT (seed 1000): SHAPES_DECODABLE  [present]
+  Shapes are decodable from the medium (best: RING_ONLY/rbf, R2 = 0.17; arms: ['FULL', 'RING_ONLY']).
+  Next: The comparison readout is the weak link: try lower noise, more sensors or a better probe, and decode the relation between the shapes directly.
+
+COMBINED: SHAPES_DECODABLE  (per seed: {1000: 'SHAPES_DECODABLE'})
+
+(total 9s)
