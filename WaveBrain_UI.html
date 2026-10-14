@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>WaveBrain Probe</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100dvh;
+      padding: 12px;
+      line-height: 1.4;
+      overscroll-behavior: none;
+    }
+
+    .container {
+      max-width: 420px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: #38bdf8;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      margin-bottom: 16px;
+    }
+
+    /* Cards */
+    .card {
+      background: #1e293b;
+      border-radius: 16px;
+      padding: 14px;
+      margin-bottom: 12px;
+      border: 1px solid #334155;
+    }
+
+    .card-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      margin-bottom: 10px;
+      font-weight: 600;
+    }
+
+    /* Medium grid */
+    .medium {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 3px;
+      aspect-ratio: 1;
+      margin-bottom: 10px;
+    }
+
+    .cell {
+      background: #0f172a;
+      border-radius: 4px;
+      position: relative;
+      transition: background 0.15s;
+    }
+
+    .cell.sensor {
+      background: #0ea5e9;
+      box-shadow: 0 0 8px #0ea5e9;
+    }
+
+    .cell.active {
+      background: #22d3ee;
+    }
+
+    /* Controls */
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      flex: 1;
+      min-width: 0;
+      background: #334155;
+      color: #e2e8f0;
+      border: none;
+      border-radius: 12px;
+      padding: 12px 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      touch-action: manipulation;
+    }
+
+    button:active {
+      transform: scale(0.97);
+    }
+
+    button.active {
+      background: #0ea5e9;
+      color: #0f172a;
+    }
+
+    button.danger {
+      background: #7f1d1d;
+    }
+
+    /* Sliders */
+    .slider-group {
+      margin-bottom: 12px;
+    }
+
+    .slider-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      margin-bottom: 6px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      height: 28px;
+      -webkit-appearance: none;
+      background: transparent;
+    }
+
+    input[type="range"]::-webkit-slider-runnable-track {
+      height: 6px;
+      background: #334155;
+      border-radius: 3px;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 22px;
+      height: 22px;
+      background: #0ea5e9;
+      border-radius: 50%;
+      margin-top: -8px;
+      box-shadow: 0 0 6px #0ea5e9;
+    }
+
+    /* Results */
+    .metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .metric {
+      background: #0f172a;
+      border-radius: 12px;
+      padding: 10px;
+      text-align: center;
+    }
+
+    .metric-value {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #38bdf8;
+    }
+
+    .metric-label {
+      font-size: 0.7rem;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .verdict {
+      text-align: center;
+      font-size: 1.1rem;
+      font-weight: 700;
+      padding: 12px;
+      border-radius: 12px;
+      margin-top: 10px;
+    }
+
+    .verdict.lossy { background: #7f1d1d; color: #fecaca; }
+    .verdict.explained { background: #14532d; color: #bbf7d0; }
+    .verdict.beats { background: #1e3a8a; color: #bfdbfe; }
+
+    .explanation {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      margin-top: 10px;
+      line-height: 1.5;
+    }
+
+    .legend {
+      display: flex;
+      gap: 12px;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+
+    .leg-sensor::before { background: #0ea5e9; }
+    .leg-active::before { background: #22d3ee; }
+    .leg-idle::before { background: #1e293b; border: 1px solid #334155; }
+
+    footer {
+      text-align: center;
+      font-size: 0.7rem;
+      color: #475569;
+      margin-top: 16px;
+      padding-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>WaveBrain Probe</h1>
+    <p class="subtitle">What the 24-sensor probe can actually see</p>
+
+    <!-- Medium visualization -->
+    <div class="card">
+      <div class="card-title">Medium (8×8 cells)</div>
+      <div class="medium" id="medium"></div>
+      <div class="legend">
+        <span class="leg-sensor">Sensor</span>
+        <span class="leg-active">Active field</span>
+        <span class="leg-idle">Idle</span>
+      </div>
+    </div>
+
+    <!-- Component toggles -->
+    <div class="card">
+      <div class="card-title">What the probe couples to</div>
+      <div class="row">
+        <button id="btn-slow" class="active">Slow field</button>
+        <button id="btn-holo">Hologram</button>
+        <button id="btn-fast">Fast field</button>
+      </div>
+      <div class="row">
+        <button id="btn-mod" class="active">Full map (0.3s + 0.5H)</button>
+      </div>
+    </div>
+
+    <!-- Noise control -->
+    <div class="card">
+      <div class="card-title">Readout noise</div>
+      <div class="slider-group">
+        <div class="slider-label">
+          <span>Noise multiplier</span>
+          <span id="noise-val">1×</span>
+        </div>
+        <input type="range" id="noise" min="0" max="16" step="1" value="1">
+      </div>
+      <div class="slider-group">
+        <div class="slider-label">
+          <span>Sensors used</span>
+          <span id="sensor-val">24</span>
+        </div>
+        <input type="range" id="sensors" min="4" max="24" step="2" value="24">
+      </div>
+    </div>
+
+    <!-- Live results -->
+    <div class="card">
+      <div class="card-title">Decoding performance (R²)</div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-value" id="r2-probe">0.42</div>
+          <div class="metric-label">Probe</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="r2-map">0.71</div>
+          <div class="metric-label">Direct map</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="eff-noise">9.8×</div>
+          <div class="metric-label">Effective noise</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="loss">41%</div>
+          <div class="metric-label">Information loss</div>
+        </div>
+      </div>
+
+      <div class="verdict lossy" id="verdict">PROBE_PATH_LOSSY</div>
+
+      <p class="explanation" id="explain">
+        At sensor-equivalent noise the probe recovers only a fraction of the shape information present in the modulation map. Most of that information lives in the slow field.
+      </p>
+    </div>
+
+    <footer>
+      Pure JS • Mobile-first • Based on WaveBrain v12 findings
+    </footer>
+  </div>
+
+  <script>
+    // ---------- State ----------
+    const state = {
+      slow: true,
+      holo: false,
+      fast: false,
+      fullMap: true,
+      noise: 1,
+      sensors: 24
+    };
+
+    // Approximate numbers inspired by the v12 report
+    const base = {
+      mod:     { 0: 0.82, 1: 0.71, 4: 0.48, 16: 0.22 },
+      mod_s:   { 0: 0.79, 1: 0.68, 4: 0.45, 16: 0.20 },
+      mod_H:   { 0: 0.28, 1: 0.18, 4: 0.04, 16: 0.01 },
+      u_full:  { 0: 0.61, 1: 0.19, 4: 0.06, 16: 0.02 },
+      probe:   0.42   // fixed probe R² from the report
+    };
+
+    // ---------- DOM ----------
+    const medium = document.getElementById('medium');
+    const noiseSlider = document.getElementById('noise');
+    const sensorSlider = document.getElementById('sensors');
+    const noiseVal = document.getElementById('noise-val');
+    const sensorVal = document.getElementById('sensor-val');
+
+    // Build 8×8 grid + place 24 sensors
+    const sensorPositions = new Set();
+    while (sensorPositions.size < 24) {
+      sensorPositions.add(Math.floor(Math.random() * 64));
+    }
+
+    for (let i = 0; i < 64; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      if (sensorPositions.has(i)) cell.classList.add('sensor');
+      cell.dataset.idx = i;
+      medium.appendChild(cell);
+    }
+
+    // ---------- Helpers ----------
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function getR2(component, noise) {
+      const keys = Object.keys(base[component]).map(Number).sort((a,b)=>a-b);
+      if (noise <= keys[0]) return base[component][keys[0]];
+      if (noise >= keys[keys.length-1]) return base[component][keys[keys.length-1]];
+
+      for (let i = 0; i < keys.length-1; i++) {
+        if (noise >= keys[i] && noise <= keys[i+1]) {
+          const t = (noise - keys[i]) / (keys[i+1] - keys[i]);
+          return lerp(base[component][keys[i]], base[component][keys[i+1]], t);
+        }
+      }
+      return 0;
+    }
+
+    function update() {
+      // Determine active component R²
+      let mapR2;
+      if (state.fullMap) {
+        mapR2 = getR2('mod', state.noise);
+      } else if (state.slow) {
+        mapR2 = getR2('mod_s', state.noise);
+      } else if (state.holo) {
+        mapR2 = getR2('mod_H', state.noise);
+      } else {
+        mapR2 = getR2('u_full', state.noise);
+      }
+
+      // Sensor count effect (roughly linear drop when < 24)
+      const sensorFactor = 0.55 + 0.45 * (state.sensors / 24);
+      mapR2 *= sensorFactor;
+
+      const probeR2 = base.probe;
+      const loss = Math.max(0, Math.round((1 - probeR2 / Math.max(mapR2, 0.01)) * 100));
+
+      // Effective noise: how much noise the map needs to match the probe
+      let eff = 1;
+      if (mapR2 > probeR2) {
+        // simple inverse estimate
+        eff = Math.round((mapR2 / probeR2) * 4 * 10) / 10;
+      }
+
+      // Verdict
+      const diff = mapR2 - probeR2;
+      let verdictText, verdictClass, explain;
+      if (diff >= 0.10) {
+        verdictText = 'PROBE_PATH_LOSSY';
+        verdictClass = 'lossy';
+        explain = 'The direct map still holds significantly more shape information than the probe recovers. The probe path is lossy.';
+      } else if (diff <= -0.10) {
+        verdictText = 'PROBE_BEATS_MODULATION';
+        verdictClass = 'beats';
+        explain = 'The probe is outperforming a direct noisy readout of the map — unexpected under the current hypothesis.';
+      } else {
+        verdictText = 'PROBE_EXPLAINED';
+        verdictClass = 'explained';
+        explain = 'Probe performance is consistent with a noisy readout of the modulation map.';
+      }
+
+      if (state.noise >= 4 && state.holo && !state.slow) {
+        explain = 'Hologram contribution collapses under moderate noise. Almost all remaining signal is carried by the slow field.';
+      }
+
+      // Update UI
+      document.getElementById('r2-probe').textContent = probeR2.toFixed(2);
+      document.getElementById('r2-map').textContent = mapR2.toFixed(2);
+      document.getElementById('eff-noise').textContent = eff.toFixed(1) + '×';
+      document.getElementById('loss').textContent = loss + '%';
+
+      const verdictEl = document.getElementById('verdict');
+      verdictEl.textContent = verdictText;
+      verdictEl.className = 'verdict ' + verdictClass;
+
+      document.getElementById('explain').textContent = explain;
+
+      // Visual activity on the grid
+      document.querySelectorAll('.cell').forEach((cell, i) => {
+        cell.classList.remove('active');
+        if (cell.classList.contains('sensor')) return;
+
+        const activity = Math.random();
+        if (state.slow && activity > 0.55) cell.classList.add('active');
+        if (state.holo && activity > 0.75) cell.classList.add('active');
+        if (state.fast && activity > 0.85) cell.classList.add('active');
+        if (state.fullMap && activity > 0.50) cell.classList.add('active');
+      });
+    }
+
+    // ---------- Event listeners ----------
+    function toggle(btn, key, exclusive = false) {
+      btn.addEventListener('click', () => {
+        if (exclusive) {
+          // exclusive group
+          document.querySelectorAll('#btn-slow, #btn-holo, #btn-fast, #btn-mod')
+            .forEach(b => b.classList.remove('active'));
+          state.slow = state.holo = state.fast = state.fullMap = false;
+          state[key] = true;
+          btn.classList.add('active');
+        } else {
+          state[key] = !state[key];
+          btn.classList.toggle('active', state[key]);
+        }
+        update();
+      });
+    }
+
+    toggle(document.getElementById('btn-slow'), 'slow', true);
+    toggle(document.getElementById('btn-holo'), 'holo', true);
+    toggle(document.getElementById('btn-fast'), 'fast', true);
+    toggle(document.getElementById('btn-mod'), 'fullMap', true);
+
+    noiseSlider.addEventListener('input', () => {
+      state.noise = Number(noiseSlider.value);
+      noiseVal.textContent = state.noise + '×';
+      update();
+    });
+
+    sensorSlider.addEventListener('input', () => {
+      state.sensors = Number(sensorSlider.value);
+      sensorVal.textContent = state.sensors;
+      update();
+    });
+
+    // Initial render
+    update();
+
+    // Gentle animation of field activity
+    setInterval(() => {
+      if (Math.random() > 0.4) update();
+    }, 1800);
+  </script>
+</body>
+</html>
