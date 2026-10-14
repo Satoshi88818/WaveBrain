@@ -1,1 +1,1 @@
-A research experiment into holographic memory plasticity 
+A research experiment into holographic memory plasticity.
