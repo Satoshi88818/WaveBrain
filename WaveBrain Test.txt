@@ -1,0 +1,20 @@
+WaveBrain Test
+
+bash
+
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+import tempfile
+from wavebrain.randstudy import run_rand_study
+with tempfile.TemporaryDirectory() as d:
+    res = run_rand_study(n_trials=24, seeds=(3,), arms=("FULL","NULL"), n_perm=3, cache_dir=d, verbose=False)
+s = res["seeds"][3]
+print({a: (v["stats"]["clip_events"], round(v["stats"]["peak_u"],2)) for a,v in s["arms"].items()})
+print(s["verdict"]["outcome"], "|", s["verdict"]["text"])
+EOF
+python3 -m pytest tests/test_randstudy.py -q -k "structure_null" 2>&1 | grep -E "passed|failed|Error" | head -3
+Output
+
+{'FULL': (0.0, 2.56), 'NULL': (3.0, 3.48)}
+INVALID_CLIPPED | Safety clip fired in NULL.
+E       AssertionError: assert 'INVALID_CLIPPED' == 'INCONCLUSIVE'
+tests/test_randstudy.py:197: AssertionError
