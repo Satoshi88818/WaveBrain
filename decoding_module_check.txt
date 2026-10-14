@@ -1,0 +1,445 @@
+bash
+
+cd /home/squire/wavebrain_project; ls /home/claude/cache_rand_final | head -3; ls /tmp/cache_rand_tune4 | head -2; md5sum wavebrain/*.py > /tmp/v9_hashes.txt; wc -l /tmp/v9_hashes.txt
+cat > wavebrain/decode.py << 'EOF'
+"""Does the medium's response contain the shapes at all?   ``python -m wavebrain.decode``
+
+v9 found that the medium does not support same/different on unseen random shapes.  A comparison
+cannot be read out of a response that does not carry the shapes, so this module asks the
+upstream question directly: can the SHAPE of each written pattern (and, as a sanity target, its
+PLACEMENT) be decoded from the medium's sensor data?
+
+Targets (computed from the generating shapes, never from the features)
+---------------------------------------------------------------------
+shape      leading components of the translation-invariant Fourier magnitude of each shape, in a
+           basis fitted on an INDEPENDENT pool of random shapes (no trial data leaks into it)
+position   the placement offsets (dy, dx) of both shapes
+
+Readouts are regressions (linear and RBF kernel ridge, hyper-parameters chosen by closed-form
+leave-one-out inside ``fit``); the score is out-of-fold R-squared averaged over standardised
+outputs.  Feature sets: the lesion arms FULL / RING_ONLY / HOLO_ONLY, the NULL arm (every trial
+physically identical: must give R-squared <= 0), and engineered features (a positive control: the
+Fourier magnitudes encode the shape descriptors exactly).  Sensor noise is re-added to the stored
+noise-free responses at several multipliers, so no new simulation is needed.
+
+Pre-registered decision rule: see ``verdict``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from functools import lru_cache
+
+import numpy as np
+
+from .pairtask import RAW_H, RAW_W
+from .pilot import strip_private
+from .randshapes import draw_offsets, random_shape, trial_shapes
+from .randstudy import BASELINE_SETS, get_rand_dataset, rand_arm_config
+from .readouts import (DEFAULT_ALPHAS, DEFAULT_GAMMAS, loo_residuals, rbf_kernel,
+                       squared_distances)
+from .study import combine_verdicts
+
+HALF = RAW_H // 2                        # each shape lives in a 40 x 40 half canvas
+N_COMPONENTS = 4                         # shape descriptors per shape
+MIN_R2 = 0.10                            # "clearly above zero" (pre-registered)
+POSITIVE_CONTROL_R2 = 0.95
+NOISE_MULTIPLIERS = (0.25, 1.0, 4.0)
+DECODE_READOUTS = ("linear", "rbf")
+DECODE_ARMS = ("FULL", "RING_ONLY", "HOLO_ONLY", "NULL")
+MEDIUM_ARMS = ("FULL", "RING_ONLY", "HOLO_ONLY")
+
+
+# ----------------------------------------------------------------- targets
+def padded_magnitude(shape: np.ndarray, half: int = HALF) -> np.ndarray:
+    """|rfft2| of the shape centred in a ``half`` x ``half`` canvas: invariant to any placement
+    that keeps the shape inside the canvas (the jitter), and identical to what the engineered
+    ``fft_concat`` features contain for that half."""
+    s = shape.shape[0]
+    canvas = np.zeros((half, half))
+    o = (half - s) // 2
+    canvas[o:o + s, o:o + s] = shape
+    return np.abs(np.fft.rfft2(canvas)).ravel()
+
+
+@lru_cache(maxsize=4)
+def shape_basis(n_components: int = N_COMPONENTS, n_pool: int = 2000, size: int = 24,
+                smooth: float = 3.0, seed: int = 424242) -> dict:
+    """PCA basis of the Fourier-magnitude descriptors, fitted on an independent shape pool."""
+    rng = np.random.default_rng(seed)
+    M = np.stack([padded_magnitude(random_shape(rng, size, smooth)) for _ in range(n_pool)])
+    mean = M.mean(axis=0)
+    _, sv, Vt = np.linalg.svd(M - mean, full_matrices=False)
+    var = sv ** 2 / (n_pool - 1)
+    return {"mean": mean, "components": Vt[:n_components], "explained": var[:n_components] / var.sum()}
+
+
+def shape_targets(cfg, basis: dict) -> np.ndarray:
+    """(n_trials, 2 * k): descriptor scores of the top shape then the bottom shape."""
+    rows = []
+    for i in range(cfg.n_trials):
+        a, b = trial_shapes(cfg, i)
+        rows.append(np.concatenate([(padded_magnitude(s) - basis["mean"]) @ basis["components"].T
+                                    for s in (a, b)]))
+    return np.array(rows)
+
+
+def position_targets(cfg) -> np.ndarray:
+    """(n_trials, 4): dy and dx of the top shape, then of the bottom shape."""
+    return np.array([draw_offsets(cfg, i).ravel() for i in range(cfg.n_trials)], dtype=float)
+
+
+# --------------------------------------------------------------- regression
+class KernelRidgeRegressor:
+    """Multi-output kernel ridge; outputs are standardised so they weigh equally in the
+    leave-one-out selection of (kernel width, alpha), which uses the training fold only."""
+
+    def __init__(self, kernel: str = "linear", alphas=None, gammas=DEFAULT_GAMMAS):
+        if kernel not in ("linear", "rbf"):
+            raise ValueError("kernel must be 'linear' or 'rbf'")
+        self.kernel = kernel
+        self.alphas = DEFAULT_ALPHAS if alphas is None else np.asarray(alphas, float)
+        self.gammas = tuple(gammas)
+
+    def _candidates(self, Xs):
+        if self.kernel == "linear":
+            yield None, Xs @ Xs.T
+        else:
+            d2 = squared_distances(Xs, Xs)
+            self.median_d2_ = float(np.median(d2[~np.eye(len(Xs), dtype=bool)])) + 1e-12
+            for g in self.gammas:
+                yield g, rbf_kernel(d2, g, self.median_d2_)
+
+    def fit(self, X, Y) -> "KernelRidgeRegressor":
+        X, Y = np.asarray(X, float), np.asarray(Y, float)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        if X.ndim != 2 or X.shape[0] != Y.shape[0] or X.shape[0] < 4:
+            raise ValueError("X must be 2-D with >= 4 rows matching Y")
+        self.mean_ = X.mean(axis=0)
+        Xc = X - self.mean_
+        self.scale_ = Xc.std() + 1e-12
+        Xs = Xc / self.scale_
+        self.y_mean_, self.y_std_ = Y.mean(axis=0), Y.std(axis=0) + 1e-12
+        Yc = (Y - self.y_mean_) / self.y_std_
+        best = (np.inf, None, None, None)
+        for param, K in self._candidates(Xs):
+            eig = np.linalg.eigh(K)
+            for a in self.alphas:
+                err = float(np.mean(loo_residuals(K, Yc, a, eig) ** 2))
+                if err < best[0]:
+                    best = (err, param, float(a), eig)
+        self.loo_error_, self.param_, self.alpha_, (evals, V) = best
+        self.dual_ = V @ ((V.T @ Yc) / (np.clip(evals, 0.0, None) + self.alpha_)[:, None])
+        self.Xs_ = Xs
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        Xs = (np.asarray(X, float) - self.mean_) / self.scale_
+        if self.kernel == "linear":
+            Kt = Xs @ self.Xs_.T
+        else:
+            Kt = rbf_kernel(squared_distances(Xs, self.Xs_), self.param_, self.median_d2_)
+        return (Kt @ self.dual_) * self.y_std_ + self.y_mean_
+
+
+def make_regressor(name: str):
+    if name not in DECODE_READOUTS:
+        raise ValueError(f"unknown regressor '{name}'")
+    return lambda: KernelRidgeRegressor(name)
+
+
+def kfold_oof(X, Y, make, k: int = 5, seed: int = 0) -> np.ndarray:
+    """Out-of-fold predictions: every row is predicted by a model that never saw it."""
+    X, Y = np.asarray(X, float), np.asarray(Y, float)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    perm = np.random.default_rng(seed).permutation(len(X))
+    pred = np.empty_like(Y)
+    for te in np.array_split(perm, k):
+        tr = np.setdiff1d(perm, te)
+        pred[te] = make().fit(X[tr], Y[tr]).predict(X[te])
+    return pred
+
+
+def squared_errors(X, Y, make, k: int = 5, repeats: int = 3, seed: int = 0) -> np.ndarray:
+    """Per-sample, per-output squared out-of-fold error, averaged over repeated splits."""
+    Y = np.asarray(Y, float)
+    return np.mean([(Y - kfold_oof(X, Y, make, k, seed + 100 * r)) ** 2 for r in range(repeats)], axis=0)
+
+
+# --------------------------------------------------------- R-squared and CIs
+def r2_from_errors(E: np.ndarray, Y: np.ndarray) -> float:
+    """Mean over outputs of 1 - SSE_j / SST_j (outputs with no variance are ignored)."""
+    sst = ((Y - Y.mean(axis=0)) ** 2).sum(axis=0)
+    ok = sst > 1e-12
+    return float(np.mean(1.0 - E.sum(axis=0)[ok] / sst[ok]))
+
+
+def r2_per_output(E: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    sst = ((Y - Y.mean(axis=0)) ** 2).sum(axis=0)
+    return 1.0 - E.sum(axis=0) / np.maximum(sst, 1e-12)
+
+
+def bootstrap_r2(E_a: np.ndarray, Y: np.ndarray, E_b: np.ndarray | None = None, n_boot: int = 2000,
+                 seed: int = 0, level: float = 0.95) -> dict:
+    """CI of R2(a), or of R2(a) - R2(b) when ``E_b`` is given.  The SAME resampled trials are used
+    for both, which keeps the pairing."""
+    Y = np.asarray(Y, float)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    n = len(Y)
+    idx = np.random.default_rng(seed).integers(0, n, size=(n_boot, n))
+    sst_i = (Y - Y.mean(axis=0)) ** 2
+    sst = sst_i[idx].sum(axis=1)                                   # (B, m)
+    ok = sst.min(axis=0) > 1e-12
+    r2 = lambda E: 1.0 - E[idx].sum(axis=1)[:, ok] / sst[:, ok]
+    boot = r2(E_a) if E_b is None else r2(E_a) - r2(E_b)
+    boot = boot.mean(axis=1)
+    point = r2_from_errors(E_a, Y) - (0.0 if E_b is None else r2_from_errors(E_b, Y))
+    lo, hi = np.quantile(boot, [(1 - level) / 2, 1 - (1 - level) / 2])
+    return {"point": float(point), "lo": float(lo), "hi": float(hi)}
+
+
+# --------------------------------------------------------------- verdict
+def decodable(sres: dict, group: str, noise: str, min_r2: float = MIN_R2) -> list:
+    """(arm, readout) pairs of the medium arms with R2 >= min_r2 AND a paired-bootstrap interval of
+    (R2 - R2 on NULL) entirely above 0 (Bonferroni-adjusted level)."""
+    found = []
+    for arm in MEDIUM_ARMS:
+        if arm not in sres["arms"]:
+            continue
+        for r, cell in sres["arms"][arm]["noise"][noise][group].items():
+            if cell["r2"] >= min_r2 and cell["diff_vs_null"]["lo"] > 0:
+                found.append((arm, r))
+    return found
+
+
+def verdict(sres: dict, base_noise: str = "1.0", low_noise: str = "0.25") -> dict:
+    """Pre-registered decision rule (fixed before the reported runs), applied per seed.
+
+    0. INVALID_CLIPPED        the safety clip fired in any arm.
+    -  INCONCLUSIVE           FULL or NULL missing.
+    1. POSITIVE_CONTROL_FAILS the engineered Fourier features do not decode the shape descriptors
+                              (R2 < 0.95): the target construction or the regression is broken.
+    2. CONTROL_FAILS          the NULL arm (identical trials) has R2 > 0.05 for any readout/target:
+                              a pipeline leak.
+    3. SHAPES_DECODABLE       some medium arm / readout has shape R2 >= 0.10 with the adjusted
+                              interval of (R2 - R2_NULL) above 0, at the base noise.
+    4. POSITION_ONLY          shapes are not decodable but placement is (same criterion).
+    5. NOTHING_DECODABLE      neither is.
+    For outcomes 4 and 5 the qualifier says whether shapes become decodable at 0.25x noise
+    ("buried-by-noise") or not even then ("absent-at-low-noise").
+    """
+    arms = sres["arms"]
+    clipped = [a for a in arms if arms[a]["stats"]["clip_events"] > 0]
+    if clipped:
+        return {"outcome": "INVALID_CLIPPED", "text": f"Safety clip fired in {', '.join(clipped)}.",
+                "next": "Lower the drive and rerun."}
+    if "FULL" not in arms or "NULL" not in arms:
+        return {"outcome": "INCONCLUSIVE", "text": "Needs FULL and NULL.", "next": "Run with both."}
+    pc = sres["baselines"]["fft_concat"]["shape"]["linear"]["r2"]
+    if pc < POSITIVE_CONTROL_R2:
+        return {"outcome": "POSITIVE_CONTROL_FAILS",
+                "text": f"Fourier features decode the shape descriptors with R2 = {pc:.3f} < "
+                        f"{POSITIVE_CONTROL_R2}: the targets or the regression are broken.",
+                "next": "Fix the target construction before interpreting anything."}
+    leaks = [(g, r) for g in ("shape", "position") for r, c in arms["NULL"]["noise"][base_noise][g].items()
+             if c["r2"] > 0.05]
+    if leaks:
+        return {"outcome": "CONTROL_FAILS",
+                "text": f"NULL (identical trials) has R2 > 0.05 for {leaks}: the pipeline leaks.",
+                "next": "Find and remove the leaking channel first."}
+    shapes = decodable(sres, "shape", base_noise)
+    if shapes:
+        best = max(shapes, key=lambda ar: arms[ar[0]]["noise"][base_noise]["shape"][ar[1]]["r2"])
+        r2 = arms[best[0]]["noise"][base_noise]["shape"][best[1]]["r2"]
+        return {"outcome": "SHAPES_DECODABLE", "qualifier": "present",
+                "text": f"Shapes are decodable from the medium (best: {best[0]}/{best[1]}, R2 = {r2:.2f}; "
+                        f"arms: {sorted({a for a, _ in shapes})}).",
+                "next": "The comparison readout is the weak link: try lower noise, more sensors or a "
+                        "better probe, and decode the relation between the shapes directly."}
+    low = decodable(sres, "shape", low_noise)
+    qualifier = "buried-by-noise" if low else "absent-at-low-noise"
+    tail = (f" Shapes become decodable at {low_noise}x noise ({sorted({a for a, _ in low})})." if low
+            else f" Not even at {low_noise}x noise.")
+    pos = decodable(sres, "position", base_noise)
+    if pos:
+        return {"outcome": "POSITION_ONLY", "qualifier": qualifier,
+                "text": "Placement is decodable from the medium but shapes are not." + tail,
+                "next": "The medium senses where energy went, not what shape it was; stop pursuing "
+                        "static-pattern comparison and test memory over time."}
+    return {"outcome": "NOTHING_DECODABLE", "qualifier": qualifier,
+            "text": "Neither shapes nor placement are decodable from the medium." + tail,
+            "next": "Check probe, sensors and noise before drawing physical conclusions."}
+
+
+# -------------------------------------------------------------------- runner
+def _features_at(ds, mult: float) -> np.ndarray:
+    return ds.features(noise_std=ds.cfg.sensor_noise * mult)
+
+
+def run_decoding(n_trials: int = 240, seeds=(0, 1), arms=DECODE_ARMS, readouts=DECODE_READOUTS,
+                 noise_multipliers=NOISE_MULTIPLIERS, cache_dir=None, n_boot: int = 2000,
+                 k: int = 5, repeats: int = 3, verbose: bool = True) -> dict:
+    t0 = time.time()
+    basis = shape_basis()
+    res = {"config": {"n_trials": n_trials, "seeds": list(seeds), "readouts": list(readouts),
+                      "noise_multipliers": list(noise_multipliers), "n_components": N_COMPONENTS,
+                      "min_r2": MIN_R2, "n_boot": n_boot,
+                      "explained_variance": [float(v) for v in basis["explained"]]}, "seeds": {}}
+    for seed in seeds:
+        cfg = rand_arm_config("FULL", seed, n_trials)
+        targets = {"shape": shape_targets(cfg, basis), "position": position_targets(cfg)}
+        datasets = {}
+        for arm in arms:
+            datasets[arm], _ = get_rand_dataset(arm, seed, n_trials, cache_dir, verbose)
+        level = 1.0 - 0.05 / (max(1, len([a for a in arms if a in MEDIUM_ARMS])) * len(readouts))
+        # squared errors for every (arm, noise, group, readout)
+        E = {}
+        for arm, ds in datasets.items():
+            for mult in noise_multipliers:
+                X = _features_at(ds, mult)
+                for g, Y in targets.items():
+                    for r in readouts:
+                        E[(arm, str(mult), g, r)] = squared_errors(X, Y, make_regressor(r), k, repeats, seed)
+        sres = {"arms": {}, "baselines": {}, "family_level": level}
+        for arm, ds in datasets.items():
+            sres["arms"][arm] = {"stats": {**{kk: float(v) for kk, v in ds.stats.items()},
+                                           "clean_spread": float(ds.features(0.0).std(axis=0).max())},
+                                 "noise": {}}
+            for mult in noise_multipliers:
+                cells = {}
+                for g, Y in targets.items():
+                    cells[g] = {}
+                    for r in readouts:
+                        Ea = E[(arm, str(mult), g, r)]
+                        ci = bootstrap_r2(Ea, Y, n_boot=n_boot, seed=seed, level=0.95)
+                        d = (bootstrap_r2(Ea, Y, E[("NULL", str(mult), g, r)], n_boot, seed, level)
+                             if "NULL" in datasets and arm != "NULL" else {"point": 0.0, "lo": 0.0, "hi": 0.0})
+                        cells[g][r] = {"r2": ci["point"], "r2_lo": ci["lo"], "r2_hi": ci["hi"],
+                                       "diff_vs_null": {"diff": d["point"], "lo": d["lo"], "hi": d["hi"]},
+                                       "per_output": [float(v) for v in r2_per_output(Ea, Y)]}
+                sres["arms"][arm]["noise"][str(mult)] = cells
+        ref = datasets[arms[0]]
+        for name in ("fft_concat", "pooled", "raw"):
+            Xb = BASELINE_SETS[name](ref.raw)
+            sres["baselines"][name] = {}
+            for g, Y in targets.items():
+                sres["baselines"][name][g] = {}
+                for r in readouts:
+                    Eb = squared_errors(Xb, Y, make_regressor(r), k, repeats, seed)
+                    ci = bootstrap_r2(Eb, Y, n_boot=n_boot, seed=seed)
+                    sres["baselines"][name][g][r] = {"r2": ci["point"], "r2_lo": ci["lo"], "r2_hi": ci["hi"],
+                                                     "per_output": [float(v) for v in r2_per_output(Eb, Y)]}
+        base_key = "1.0" if "1.0" in sres["arms"][arms[0]]["noise"] else str(noise_multipliers[0])
+        low_key = str(min(noise_multipliers))
+        sres["verdict"] = verdict(sres, base_noise=base_key, low_noise=low_key)
+        res["seeds"][seed] = sres
+        if verbose:
+            v = sres["verdict"]
+            print(f"[seed {seed}] {v['outcome']}: {v['text']}", flush=True)
+    res["combined"] = combine_verdicts({s: r["verdict"] for s, r in res["seeds"].items()})
+    res["seconds"] = time.time() - t0
+    return res
+
+
+def format_report(res: dict) -> str:
+    c = res["config"]
+    rd = c["readouts"]
+    lines = [f"WaveBrain shape-decoding diagnostic (trials={c['n_trials']}, seeds={c['seeds']}, "
+             f"{c['n_components']} descriptors per shape explaining "
+             f"{100 * sum(c['explained_variance']):.0f}% of descriptor variance, min R2 {c['min_r2']})"]
+    for seed, s in res["seeds"].items():
+        base = "1.0" if "1.0" in next(iter(s["arms"].values()))["noise"] else sorted(next(iter(s["arms"].values()))["noise"])[0]
+        lines += ["", f"=== seed {seed}, noise x{base}: cross-validated R2 [95% CI]; diff = R2 - R2(NULL) [adj. CI] ===",
+                  f"{'features':<24}" + "".join(f"{'shape/' + r:>26}" for r in rd) + "".join(f"{'position/' + r:>26}" for r in rd),
+                  "-" * (24 + 26 * 2 * len(rd))]
+        for arm, a in s["arms"].items():
+            cells = a["noise"][base]
+            row = f"{arm:<24}"
+            for g in ("shape", "position"):
+                for r in rd:
+                    x = cells[g][r]
+                    row += f"{x['r2']:+.2f} [{x['r2_lo']:+.2f},{x['r2_hi']:+.2f}]".rjust(26)
+            lines.append(row)
+        for name, b in s["baselines"].items():
+            row = f"{name + ' (engineered)':<24}"
+            for g in ("shape", "position"):
+                for r in rd:
+                    x = b[g][r]
+                    row += f"{x['r2']:+.2f} [{x['r2_lo']:+.2f},{x['r2_hi']:+.2f}]".rjust(26)
+            lines.append(row)
+        lines += ["", "gain over NULL, shape, base noise [adjusted CI]:"]
+        for arm, a in s["arms"].items():
+            if arm != "NULL":
+                lines.append(f"  {arm:<10}" + "  ".join(
+                    f"{r} {a['noise'][base]['shape'][r]['diff_vs_null']['diff']:+.3f} "
+                    f"[{a['noise'][base]['shape'][r]['diff_vs_null']['lo']:+.3f},{a['noise'][base]['shape'][r]['diff_vs_null']['hi']:+.3f}]"
+                    for r in rd))
+        mults = c["noise_multipliers"]
+        lines += ["", "noise sweep, shape R2 (readout: " + "/".join(rd) + "):",
+                  f"{'arm':<12}" + "".join(f"{'x' + str(m):>20}" for m in mults)]
+        for arm, a in s["arms"].items():
+            lines.append(f"{arm:<12}" + "".join(
+                ("  ".join(f"{a['noise'][str(m)]['shape'][r]['r2']:+.2f}" for r in rd)).rjust(20) for m in mults))
+        f = s["arms"]["FULL"]["noise"][base]["shape"][rd[0]]["per_output"]
+        lines += ["", f"FULL/{rd[0]} shape R2 per descriptor (top PC1..{c['n_components']}, bottom PC1..{c['n_components']}): "
+                  + " ".join(f"{v:+.2f}" for v in f)]
+        v = s["verdict"]
+        lines += ["", f"VERDICT (seed {seed}): {v['outcome']}" + (f"  [{v['qualifier']}]" if "qualifier" in v else ""),
+                  f"  {v['text']}", f"  Next: {v['next']}"]
+    cmb = res["combined"]
+    lines += ["", f"COMBINED: {cmb['outcome']}  (per seed: {cmb['per_seed']})"]
+    return "\n".join(lines)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--trials", type=int, default=240)
+    ap.add_argument("--seeds", default="0,1")
+    ap.add_argument("--arms", default=",".join(DECODE_ARMS))
+    ap.add_argument("--cache", default=None, help="directory holding the random-shape datasets")
+    ap.add_argument("--boot", type=int, default=2000)
+    ap.add_argument("--json", default=None)
+    a = ap.parse_args(argv)
+    res = run_decoding(a.trials, tuple(int(s) for s in a.seeds.split(",")), tuple(a.arms.split(",")),
+                       cache_dir=a.cache, n_boot=a.boot)
+    print("\n" + format_report(res) + f"\n\n(total {res['seconds']:.0f}s)")
+    if a.json:
+        def stringify(o):
+            return {str(k): stringify(v) for k, v in o.items()} if isinstance(o, dict) else o
+        with open(a.json, "w") as fh:
+            json.dump(strip_private(stringify(res)), fh, indent=2)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+python3 - << 'EOF'
+import numpy as np, time
+from wavebrain.decode import *
+from wavebrain.randstudy import rand_arm_config, BASELINE_SETS
+from wavebrain.randshapes import build_rand_raw
+b = shape_basis()
+print("descriptor basis: explained variance of the 4 components:", np.round(b["explained"],3), "sum", round(float(b["explained"].sum()),3))
+cfg = rand_arm_config("FULL", 1000, 120)
+Y = shape_targets(cfg, b); P = position_targets(cfg)
+raw, y = build_rand_raw(cfg)
+X = BASELINE_SETS["fft_concat"](raw)
+t=time.time(); E = squared_errors(X, Y, make_regressor("linear")); print("positive control fft_concat -> shape R2 (linear):", round(r2_from_errors(E,Y),4), f"({time.time()-t:.1f}s)")
+E2 = squared_errors(np.random.default_rng(0).normal(size=(120,50)), Y, make_regressor("linear")); print("pure-noise features -> shape R2:", round(r2_from_errors(E2,Y),3))
+EOF
+Output
+
+rand_FULL_seed0_n240.npz
+rand_FULL_seed1_n240.npz
+rand_HOLO_ONLY_seed0_n240.npz
+rand_FULL_seed1000_n120.npz
+rand_HOLO_ONLY_seed1000_n120.npz
+16 /tmp/v9_hashes.txt
+descriptor basis: explained variance of the 4 components: [0.196 0.189 0.15  0.05 ] sum 0.585
+positive control fft_concat -> shape R2 (linear): 0.9993 (0.1s)
+pure-noise features -> shape R2: -0.018
