@@ -1,0 +1,244 @@
+cd /home/squire/wavebrain_project; find . -name __pycache__ -prune -exec rm -rf {} + ; rm -rf .pytest_cache .coverage
+setsid nohup sh -c "python3 -m coverage run --source=wavebrain -m pytest > /tmp/full_tests6.txt 2>&1; python3 -m coverage report > coverage_report.txt 2>&1; python3 mutation_check.py --group modmap > mutation_output_modmap.txt 2>&1" < /dev/null > /dev/null 2>&1 &
+cat > /home/squire/build_md7.py << 'PYEOF'
+import json, re, subprocess, sys
+from pathlib import Path
+
+R = Path("/home/squire/wavebrain_project")
+read = lambda p: (R / p).read_text().rstrip("\n")
+M = json.loads(read("modmap_results.json")); V11 = json.loads(read("statedecode_results.json"))
+out = read("modmap_output.txt"); table = out[out.index("WaveBrain modulation-map"):]
+cov = read("coverage_report.txt"); test_run = read("pytest_final.txt"); mut = read("mutation_output_modmap.txt")
+collect = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q"], cwd=R, capture_output=True, text=True).stdout
+counts = {}
+for line in collect.splitlines():
+    m = re.match(r"tests/(\w+)\.py: (\d+)", line)
+    if m: counts[m.group(1)] = int(m.group(2)); continue
+    m = re.match(r"tests/(\w+)\.py::", line)
+    if m: counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+total = sum(counts.values()); assert total > 220, counts
+n_new = counts.get("test_modmap", 0)
+
+def rng(v, d=2):
+    lo, hi = min(v), max(v)
+    return f"{lo:+.{d}f}" if f"{lo:+.{d}f}" == f"{hi:+.{d}f}" else f"{lo:+.{d}f} to {hi:+.{d}f}"
+def rng0(v, d=2):
+    lo, hi = min(v), max(v)
+    return f"{lo:.{d}f}" if f"{lo:.{d}f}" == f"{hi:.{d}f}" else f"{lo:.{d}f} to {hi:.{d}f}"
+SEEDS = ("0", "1")
+c = lambda s, n, m, v, r: M["seeds"][s]["states"][n][m][v][r]["r2"]
+vals = lambda n, m, v, r: [c(s, n, m, v, r) for s in SEEDS]
+probe = [M["seeds"][s]["probe_r2"] for s in SEEDS]
+eff = lambda key: [M["seeds"][s]["effective_noise"][key] for s in SEEDS]
+effs = lambda key: " and ".join(f"{e:.1f}" for e in eff(key))
+vd = {s: M["seeds"][s]["verdict"] for s in SEEDS}; va = {s: M["seeds"][s]["verdict_at"] for s in SEEDS}
+repro = max(max(M["seeds"][s]["reproduction"].values()) for s in SEEDS)
+null_rbf = [c(s, "NULL", m, "pool4", "rbf") for s in SEEDS for m in ("1.0", "4.0", "16.0")]
+null_lin = [c(s, "NULL", m, "pool4", "linear") for s in SEEDS for m in ("1.0", "4.0", "16.0")]
+mut_total = sum(int(x) for x in re.findall(r"(\d+)/\d+ injected", mut)); mut_of = sum(int(x) for x in re.findall(r"\d+/(\d+) injected", mut))
+
+v6 = ["wavebrain/__init__.py", "wavebrain/config.py", "wavebrain/sources.py", "wavebrain/sensors.py", "wavebrain/medium.py",
+      "wavebrain/classifier.py", "wavebrain/experiment.py", "wavebrain/benchmark.py"]
+v7 = ["wavebrain/stats.py", "wavebrain/pairtask.py", "wavebrain/pilot.py"]
+v8 = ["wavebrain/readouts.py", "wavebrain/study.py", "wavebrain/baselines.py"]
+v9 = ["wavebrain/randshapes.py", "wavebrain/randstudy.py"]
+v10 = ["wavebrain/decode.py", "wavebrain/noisecheck.py"]
+v11 = ["wavebrain/statedecode.py"]
+new_files = ["wavebrain/modmap.py"]; new_tests = ["tests/test_modmap.py"]
+old_tests = ["tests/test_config.py", "tests/test_medium.py", "tests/test_sensors.py", "tests/test_classifier.py", "tests/test_experiment.py",
+             "tests/test_pilot.py", "tests/test_readouts.py", "tests/test_study.py", "tests/test_baselines.py", "tests/test_randshapes.py",
+             "tests/test_randstudy.py", "tests/test_decode.py", "tests/test_noisecheck.py", "tests/test_statedecode.py"]
+
+md = f"""# WaveBrain v12: what the probe can see of the stored state (validated)
+
+This document implements the next step recommended after v11: test the hypothesis that the probe reaches the stored state through the local wave speed (`c2 = c0 * (1 + 0.3 s + 0.5 H)`), and make the comparison amplitude-aware by adding readout noise. It uses the cached state arrays of v11 (no new simulation) and extends the package without modifying any v6 to v11 module (checked by hash). Everything below (source, test output, results) comes from running the code in this document. Only `numpy` is required at runtime; `pytest` is needed for the tests.
+
+## 1. Result in one paragraph
+
+**The part of the stored state the probe couples to is dominated by the slow field, and the probe recovers only a fraction of what it holds.** The modulation map `0.3 s + 0.5 H` decodes the shapes with R-squared {rng0(vals('mod','1.0','pool4','rbf'))} when read with noise equal to the sensor noise (RBF readout; {rng0(vals('mod','1.0','sub24','rbf'))} from only 24 values), {rng0(vals('mod','4.0','pool4','rbf'))} at four times that noise and {rng0(vals('mod','16.0','pool4','rbf'))} at sixteen times. Almost all of it comes from the slow field (`mod_s` {rng0(vals('mod_s','1.0','pool4','rbf'))}); the hologram part is small ({rng0(vals('mod_H','1.0','pool4','rbf'))}) and gone by four times the noise ({rng0(vals('mod_H','4.0','pool4','rbf'))}); and the hologram-off arm decodes as well as the full one (`mod_ring` {rng0(vals('mod_ring','1.0','pool4','rbf'))}). The fast field is buried by noise: {rng0(vals('u_full','0.0','pool4','linear'))} noise-free, {rng0(vals('u_full','1.0','pool4','rbf'))} at the sensor noise level.
+
+The probe recovered {rng0(probe)}. A direct readout of the modulation map would be exactly as informative as the probe with about **{effs('mod/pool4')} times** the sensor noise (about {effs('mod/sub24')} times from 24 values), so the probe path loses most of what the map holds.
+
+The pre-registered rule returns **{vd['0']['outcome']}** in both seeds at the sensor noise level, **but that label rests on an arbitrary noise assumption** (section 3): it becomes {va['0']['4.0']} at four times the noise and {va['0']['16.0']} (seed 0) or {va['1']['16.0']} (seed 1) at sixteen times.
+
+---
+
+## 2. What this changes in the story
+
+* v11 left a hypothesis: the probe sees the medium through `c2`, and the "ring-down" of v9 and v10 is largely the slow field. **Partly supported**: the slow part of the modulation map carries essentially all of its decodable shape information, and the hologram-off arm decodes as well as the full arm, so the information the probe can couple to is mostly the slow field, not the hologram.
+* **Not settled**: whether the probe actually uses the map. The fast field read with the sensor noise ({effs('u_full/pool4')} times) matches the probe's R-squared just as well as the modulation map read with about {effs('mod/pool4')} times the noise. The data cannot separate "the probe reads the map through a lossy path" from "the probe reads the fast field", so I do not claim the first.
+* The hologram contributes nothing detectable to the shape information in the modulation map beyond the slow field. That agrees with v10 (hologram-only R-squared near zero) and now has a noise-aware version.
+
+---
+
+## 3. Corrections and honest caveats
+
+1. **The pre-registered comparison depends on an arbitrary noise assumption.** I set the primary level to "readout noise equal to the sensor noise on each pooled value", but a pooled value averages 16 raw cells and the probe path is noised differently, so that level is only a rough equivalent. The outcome changes with it: {va['0']['1.0']} at 1x, {va['0']['4.0']} at 4x, then {va['0']['16.0']} (seed 0) or {va['1']['16.0']} (seed 1) at 16x. I report all levels and I added a descriptive statistic before the reported run, the noise multiplier at which a direct readout equals the probe, which does not presume any equivalence. The label PROBE_PATH_LOSSY should be read as "at equal noise", not as a finding about the physics.
+2. **The qualifier `both` overstates the hologram.** It is printed because the hologram part of the map passes R-squared 0.10 at the sensor noise level, but it falls to {rng0(vals('mod_H','4.0','pool4','rbf'))} at four times the noise and the map decodes just as well without it (hologram-off arm). It means "the hologram part is not zero", not "the hologram matters".
+3. **Linear readouts are unreliable on noisy high-dimensional features.** On the noise-only NULL arm the linear readout reaches R-squared of {rng(null_lin)} (the RBF readout {rng(null_rbf)}). The verdict uses the best readout over both, so it is unaffected, but linear numbers under noise should not be read as information content.
+4. **The slow field's decay law was not measured.** Its amplitude at the probe start is large, but it is not a simple exponential (low-wavenumber components of an overdamped mode decay slowly), so it is unknown how long it lasts. That is what the retention experiment is for.
+5. **The comparison with the probe is between different quantities.** The probe's R-squared is computed from 24 sensors with temporal features at one noise level; the states are pooled values with an added noise model. The effective-noise statistic is a calibration, not an identity.
+6. **Cross-check passes.** At zero noise the rescaled states reproduce the v11 R-squared values to within {repro:.0e}, as they must since R-squared is invariant to rescaling the features.
+
+---
+
+## 4. Design
+
+### Feature sets (from the cached pooled state arrays of v11)
+
+`mod` = `slow_mod * s + holo_mod * H` of the FULL arm, with the coefficients read from the medium configuration (0.3 and 0.5); `mod_s` and `mod_H` its two parts; `mod_ring` = `slow_mod * s` of the hologram-off arm; `u_full`, `u_ring` the fast fields (their linear effect on the probe is removed by the paired baseline subtraction); `NULL` zeros. Readout noise of standard deviation `0.015 * k` for k = 1, 4 and 16 is added to every pooled value, **the same realisation for every state**, so differences between states are differences of signal. A 24-value subset matches the sensor count.
+
+### Targets, regression, statistics
+
+The v10 shape targets and regressors (linear and RBF kernel ridge, leave-one-out selection on the training fold, out-of-fold R-squared, bootstrap intervals, paired gains over NULL at a Bonferroni-adjusted level for 6 states times 2 readouts). Controls from v11: Fourier features (positive), noise-only NULL, and the pooled written map.
+
+### Decision rule (fixed before the reported run)
+
+With m = best R-squared of `mod` at noise level k = 1 (counted only if its interval versus NULL is above 0), m_sub the same from 24 values, p = the v10 probe R-squared of the same trials, band 0.10: **PROBE_PATH_LOSSY** if m_sub is at least p + 0.10; **BANDWIDTH_LIMITED** if m is at least p + 0.10 but m_sub is not; **PROBE_EXPLAINED** if m is between p - 0.10 and p + 0.10; **PROBE_BEATS_MODULATION** if m is below p - 0.10. Controls first (**INVALID_CLIPPED**, **POSITIVE_CONTROL_FAILS**, **CONTROL_FAILS**, **STATE_CONTROL_FAILS**). Qualifiers: which part of the map carries shape (slow / hologram / both / neither, at least 0.10) and whether the fast field is visible at that noise.
+
+### What was tuned, and on which data
+
+* The tuning pass used **seed 1000** (120 trials, probe reference 0.15 from the earlier tuning run). It showed that the outcome flips with the noise level, which prompted the descriptive effective-noise statistic, added before the reported run.
+* Seeds **0 and 1** were analysed once, with the code listed here (hashes recorded at launch and verified afterwards).
+
+---
+
+## 5. Results (seeds 0 and 1, 240 trials each)
+
+```text
+{table}
+```
+
+### Reading the table
+
+* **Controls pass.** Fourier features R-squared 1.000, pooled written map placement {rng0([M['seeds'][s]['baselines']['map']['position']['rbf']['r2'] for s in SEEDS])}, NULL (noise only) {rng(null_rbf)} with the RBF readout. The reproduction of v11 is exact.
+* **The slow field dominates.** At noise x1: `mod` {rng0(vals('mod','1.0','pool4','rbf'))}, `mod_s` {rng0(vals('mod_s','1.0','pool4','rbf'))}, `mod_ring` {rng0(vals('mod_ring','1.0','pool4','rbf'))}, `mod_H` {rng0(vals('mod_H','1.0','pool4','rbf'))}. At x4: {rng0(vals('mod','4.0','pool4','rbf'))}, {rng0(vals('mod_s','4.0','pool4','rbf'))}, {rng0(vals('mod_ring','4.0','pool4','rbf'))}, {rng(vals('mod_H','4.0','pool4','rbf'))}.
+* **The fast field is buried.** `u_full`: {rng0(vals('u_full','0.0','pool4','linear'))} noise-free (linear), {rng0(vals('u_full','1.0','pool4','rbf'))} at x1, {rng0(vals('u_full','4.0','pool4','rbf'))} at x4, {rng0(vals('u_full','16.0','pool4','rbf'))} at x16 (RBF).
+* **A small subset is almost as good.** At x1, 24 random values of `mod` give {rng0(vals('mod','1.0','sub24','rbf'))} against {rng0(vals('mod','1.0','pool4','rbf'))} for all 361 values: channel count is not what limits the map at this noise, but it matters at x4 ({rng0(vals('mod','4.0','sub24','rbf'))} against {rng0(vals('mod','4.0','pool4','rbf'))}).
+* **Probe calibration.** Probe R-squared {rng0(probe)}; equivalent readout noise for a direct readout: `mod` (361 values) x{effs('mod/pool4')}, `mod` (24 values) x{effs('mod/sub24')}, `mod_s` x{effs('mod_s/pool4')}, fast field x{effs('u_full/pool4')}.
+
+---
+
+## 6. What this does and does not show
+
+**Shown:** the information the probe can couple to (the modulation map) is carried almost entirely by the slow field; the hologram's part is small and fragile under noise and adds nothing beyond the slow field; the fast field is buried by realistic noise; the probe recovers about what a direct readout of the map would with roughly ten times the sensor noise.
+
+**Not shown:** that the probe actually reads the map (the fast field fits the probe's R-squared equally well); how long the slow field lasts; whether the plastic hologram extends memory over longer delays (only 250 steps were examined); and anything about a better probe, since none was tried.
+
+---
+
+## 7. Problems found while building this
+
+| # | Problem | How it surfaced | Fix | Guard |
+|---|---|---|---|---|
+| 1 | The pre-registered verdict flips with the assumed noise level | tuning pass | all levels reported; descriptive effective-noise statistic added before the reported run | `test_effective_noise_multiplier_interpolates_in_log_scale_and_flags_out_of_range`, `test_verdict_can_be_evaluated_at_another_noise_level` |
+| 2 | Docstring and code disagreed at the boundary of PROBE_EXPLAINED | writing the boundary tests | documentation corrected to match the code | `test_verdict_classifies_the_probe_against_the_modulation_map` |
+| 3 | A leftover line in my test set one noise level's entry to `None` | first test run | line removed | the test itself |
+| 4 | The `both` qualifier is misleading | reading the result | stated in section 3 | not code |
+
+---
+
+## 8. Validation evidence
+
+**Test suite**: {total} tests, all passing ({n_new} new here; the earlier {total - n_new} unchanged).
+
+```text
+{test_run}
+```
+
+| file | tests | covers |
+|---|---|---|
+| earlier test files | {total - n_new} | v6 to v11 (unchanged) |
+| `test_modmap.py` | {n_new} | modulation maps use the medium coefficients and the right arms, noise scaling, sharing across states and reproducibility, NULL really noisy, R-squared invariant to rescaling, every verdict branch and boundary, interval requirement, qualifiers, verdict at other noise levels, effective-noise interpolation (log scale, out-of-range, noise-free point ignored), reproduction check against v11, family-wise level, end-to-end runner, report and CLI |
+
+**Coverage**
+
+```text
+{cov}
+```
+
+**Mutation check for the new code**: each defect is injected into a temporary copy and the relevant tests must fail. {mut_total} of {mut_of} were caught on the first run.
+
+```text
+{mut}
+```
+
+The 82 mutations of v6 to v11 were checked in the earlier rounds (all caught); those modules are byte-identical now.
+
+---
+
+## 9. Recommended next step
+
+The slow field carries the shape information the probe can reach, but nothing so far shows how long it lasts, and the hologram (the only memory designed to persist) contributes little at 250 steps. The retention experiment can now be designed properly. It needs **new simulation** (about 20 to 30 minutes):
+
+1. **Delays of 0, 250, 500, 1000 and 2000 steps**, with three lesions made at the end of the write phase: **hologram only** (fast and slow fields zeroed), **hologram plus slow field** (fast field zeroed), and **slow field only** (hologram off, fast field zeroed). The v9 to v11 lesions never separated the slow field from the fast one.
+2. **Decode shapes from the modulation map** `0.3 s + 0.5 H` at the sensor-equivalent noise levels used here, and compare with the probe-based decoding at the same delays.
+3. **Pre-registered prediction to test:** the slow field dominates at short delays and fades; the hologram's part, small at 250 steps, is the one that persists. If so, the hologram's R-squared should exceed the slow field's at long delays and plasticity extends memory. If both fade together, or the hologram never exceeds the noise floor, the plastic memory does not add to the field memory in this design, and the write rule needs redesigning (for example a reference-beam hologram).
+
+---
+
+## 10. Limitations
+
+* **One medium, one configuration, two seeds** of 240 trials; the results agree across seeds.
+* **The noise model is a calibration**, not the real probe path; conclusions about the probe rest on the effective-noise statistic and are qualitative.
+* **Pooling to 361 values** and the random 24-value subset are choices; the pooled written map is a weak reference (about 0.45 for shape).
+* **Only one delay (250 steps)** is examined; nothing here speaks about retention.
+* **The probe's use of the map is a hypothesis**, consistent with the data but not separated from the alternative that it reads the fast field.
+* **The verdict label depends on the noise assumption** (section 3).
+
+---
+
+## 11. Quick start
+
+```bash
+pip install numpy pytest                  # coverage is optional
+python -m pytest                          # about 5 min, {total} tests
+python -m wavebrain.modmap --seeds 0,1 --cache cache_state --probe-json decode_results.json \\
+    --statedecode-json statedecode_results.json --json modmap_results.json     # about 1 min with a warm cache
+python mutation_check.py --group modmap   # re-introduces the new defects
+```
+
+`cache_state` is the directory written by `python -m wavebrain.statedecode --cache cache_state` (v11); `decode_results.json` and `statedecode_results.json` are the v10 and v11 outputs. Use another seed (for example 1000) when experimenting so seeds 0 and 1 stay untouched.
+
+## 12. Project layout
+
+```text
+wavebrain_project/
+  pytest.ini  mutation_check.py (extended)  seed_check.py
+  wavebrain/
+    config.py sources.py sensors.py medium.py classifier.py experiment.py benchmark.py   (v6, unchanged)
+    stats.py pairtask.py pilot.py                                                          (v7, unchanged)
+    readouts.py study.py baselines.py                                                      (v8, unchanged)
+    randshapes.py randstudy.py                                                             (v9, unchanged)
+    decode.py noisecheck.py                                                                (v10, unchanged)
+    statedecode.py                                                                         (v11, unchanged)
+    modmap.py       NEW  modulation maps, amplitude-aware noise, probe comparison, effective noise
+  tests/            {total} tests; new: test_modmap.py
+```
+
+---
+
+## 13. Source code
+
+### 13.1 New module
+
+"""
+def block(f):
+    lang = "ini" if f.endswith(".ini") else "python"
+    return f"#### `{f}`\n\n```{lang}\n{read(f)}\n```\n\n"
+for f in new_files: md += block(f)
+md += "### 13.2 New test and the extended mutation script\n\n"
+for f in new_tests + ["mutation_check.py"]: md += block(f)
+md += "### 13.3 Unchanged v6 to v11 modules (included so this document is self-contained)\n\n"
+for f in v6 + v7 + v8 + v9 + v10 + v11: md += block(f)
+md += "### 13.4 Unchanged earlier tests and scripts\n\n"
+for f in old_tests + ["seed_check.py", "pytest.ini"]: md += block(f)
+Path("/mnt/user-data/outputs").mkdir(parents=True, exist_ok=True)
+Path("/mnt/user-data/outputs/WaveBrain_v12_modulation_map.md").write_text(md)
+print("written", len(md), "chars,", md.count("\n"), "lines; tests:", total, counts)
+PYEOF
+sleep 200; tail -2 /tmp/full_tests6.txt
+
+Response:
+
+{"returncode":0,"stdout":"........................................................................ [ 63%]\n...........","stderr":""}
