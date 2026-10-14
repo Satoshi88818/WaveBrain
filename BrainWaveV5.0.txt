@@ -1,0 +1,662 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numba as nb
+
+# Named constants for better readability and tunability
+PML_WIDTH = 32
+PML_STRENGTH = 0.935
+PML_POWER = 3.0
+
+DAMPING_FAST = 0.992
+DAMPING_SLOW = DAMPING_FAST * 0.98
+
+NONLINEAR_COEFF = 0.00185
+NONLINEAR_SOFTEN_DIV = 10000
+
+HOLO_WRITE_RATE = 0.0014
+HOLO_DECAY = 0.99975
+HOLO_MOD_STRENGTH = 0.0011
+HOLO_SATURATION = 45.0
+ENGRAVE_BOOST_FACTOR = 8.0
+ENGRAVE_DURATION = 450
+
+PARTICLE_GRAD_SCALE_BASE = 0.0092
+PARTICLE_ADV_FACTOR_BASE = 0.029
+PARTICLE_ADV_DENOM_BASE = 0.8
+PARTICLE_ADV_DENOM_SCALE = 0.24
+PARTICLE_VEL_DECAY = 0.87
+PARTICLE_POS_SCALE = 0.78
+PARTICLE_VEL_MAX = 5.8
+PARTICLE_JITTER_SCALE = 0.11
+PARTICLE_JITTER_DENOM_OFFSET = 0.2
+PARTICLE_STICKINESS_DECAY = 0.979
+PARTICLE_STICKINESS_MIN = 0.68
+PARTICLE_STICKINESS_MAX = 7.8
+PARTICLE_STICKINESS_BOOST_MAX_POT = 24.0
+PARTICLE_STICKINESS_BOOST_SCALE = 0.31
+
+PACEMAKER_RADIUS = 5
+NEURON_RADIUS = 3
+SPIKE_THRESHOLD = 50.0
+SPIKE_IMPULSE = 100.0
+SPIKE_COOLDOWN = 30
+PACEMAKER_BOOST_FACTOR = 1.2
+PACEMAKER_AMP_CAP = 60
+
+READOUT_PROBE_OMEGA = 0.62
+READOUT_PROBE_AMP = 31.0
+READOUT_DECAY_TAU = 38.0
+READOUT_PROBE_WIDTH = 14
+
+FIELD_LIMIT = 180.0
+TIME_STEP = 0.072
+NOISE_INTERVAL = 50
+NOISE_SCALE = 1e-4
+
+RECORD_EVERY = 100
+PCA_N_COMPONENTS = 5
+
+DROP_PROB = 0.032
+DROP_INTENSITY = 68
+DROP_WIDTH = 7
+PATTERN_SIZE = 48
+PATTERN_AMP = 95
+PATTERN_MARGIN = 60
+
+PARTICLE_PLOT_FRACTION = 0.25
+PARTICLE_SIZE_BASE = 0.85
+PARTICLE_SIZE_SCALE = 0.62
+
+@nb.njit(parallel=True)
+def update_particles_jit(particles, vel, stickiness, potential, gy, gx, du, jitter, nx, ny):
+    """
+    Just-in-time compiled function to update particle positions, velocities, and stickiness in parallel.
+
+    Parameters:
+    - particles: Array of particle positions (num_particles, 2)
+    - vel: Array of particle velocities (num_particles, 2)
+    - stickiness: Array of particle stickiness values (num_particles,)
+    - potential: 2D array of potential field (ny, nx)
+    - gy, gx: Gradients of potential (ny, nx)
+    - du: Difference in u field (ny, nx)
+    - jitter: Random jitter for each particle (num_particles, 2)
+    - nx, ny: Grid dimensions
+    """
+    num_p = len(particles)
+    for i in nb.prange(num_p):
+        px = int(particles[i, 0])
+        py = int(particles[i, 1])
+        px = min(max(px, 0), nx - 1)
+        py = min(max(py, 0), ny - 1)
+        grad_scale = PARTICLE_GRAD_SCALE_BASE * stickiness[i]
+        acc_grad_x = -gx[py, px] * grad_scale
+        acc_grad_y = -gy[py, px] * grad_scale
+        adv_factor = PARTICLE_ADV_FACTOR_BASE / (PARTICLE_ADV_DENOM_BASE + stickiness[i] * PARTICLE_ADV_DENOM_SCALE)
+        acc_adv_x = du[py, px] * adv_factor
+        acc_adv_y = du[py, px] * adv_factor
+        vel[i, 0] += acc_grad_x + acc_adv_x
+        vel[i, 1] += acc_grad_y + acc_adv_y
+
+    vel *= PARTICLE_VEL_DECAY
+
+    for i in nb.prange(num_p):
+        vel[i, 0] += jitter[i, 0]
+        vel[i, 1] += jitter[i, 1]
+
+    for i in nb.prange(num_p):
+        if vel[i, 0] > PARTICLE_VEL_MAX:
+            vel[i, 0] = PARTICLE_VEL_MAX
+        elif vel[i, 0] < -PARTICLE_VEL_MAX:
+            vel[i, 0] = -PARTICLE_VEL_MAX
+        if vel[i, 1] > PARTICLE_VEL_MAX:
+            vel[i, 1] = PARTICLE_VEL_MAX
+        elif vel[i, 1] < -PARTICLE_VEL_MAX:
+            vel[i, 1] = -PARTICLE_VEL_MAX
+
+    for i in nb.prange(num_p):
+        particles[i, 0] += vel[i, 0] * PARTICLE_POS_SCALE
+        particles[i, 1] += vel[i, 1] * PARTICLE_POS_SCALE
+        if particles[i, 0] < 0:
+            particles[i, 0] = 0
+        elif particles[i, 0] > nx - 1:
+            particles[i, 0] = nx - 1
+        if particles[i, 1] < 0:
+            particles[i, 1] = 0
+        elif particles[i, 1] > ny - 1:
+            particles[i, 1] = ny - 1
+
+    for i in nb.prange(num_p):
+        px = int(particles[i, 0])
+        py = int(particles[i, 1])
+        px = min(max(px, 0), nx - 1)
+        py = min(max(py, 0), ny - 1)
+        local_pot = potential[py, px]
+        node_boost = max(0.0, PARTICLE_STICKINESS_BOOST_MAX_POT - local_pot) / PARTICLE_STICKINESS_BOOST_MAX_POT * PARTICLE_STICKINESS_BOOST_SCALE
+        stickiness[i] *= PARTICLE_STICKINESS_DECAY
+        stickiness[i] += node_boost
+        if stickiness[i] < PARTICLE_STICKINESS_MIN:
+            stickiness[i] = PARTICLE_STICKINESS_MIN
+        elif stickiness[i] > PARTICLE_STICKINESS_MAX:
+            stickiness[i] = PARTICLE_STICKINESS_MAX
+
+
+class WaveBrainSimulator:
+    """
+    Hybrid WaveBrainSimulator - Merging holographic memory with advanced wave dynamics features.
+
+    This class simulates a 2D wave field with fast and slow components, holographic memory,
+    inertial particles, pacemakers, spiking neurons, and machine learning-based readout for
+    pattern classification.
+
+    Key Features:
+    - Combined complex wave field (real: fast waves, imag: slow waves)
+    - Leapfrog time-stepping with nonlinearities for shocks and solitons
+    - Holographic interference for memory engraving and modulation
+    - Inertial particles with adaptive stickiness (Hebbian-like)
+    - Localized pacemakers for rhythmic driving
+    - Threshold-based spiking neurons with feedback
+    - Probe-based readout with MLP classification
+    - PCA on hologram history for dimensionality reduction
+
+    Parameters:
+    - nx, ny: Grid dimensions (default: 380x380)
+    - c_fast, c_slow: Wave speeds for fast and slow fields
+    - dt: Time step size
+    - damping: Global damping factor (overridden by constants)
+    - num_particles: Number of inertial particles
+    - num_pacemakers: Number of pacemaker oscillators
+    - num_neurons: Number of spiking neurons
+    """
+    def __init__(self, nx=380, ny=380, c_fast=0.58, c_slow=0.1, dt=1.0,
+                 damping=0.992, num_particles=6800, num_pacemakers=8, num_neurons=20):
+        self.nx = nx
+        self.ny = ny
+        self.c_fast = c_fast
+        self.c_slow = c_slow
+        self.dt = dt
+        self.alpha2_fast = (c_fast * dt) ** 2
+        self.alpha2_slow = (c_slow * dt) ** 2
+        self.damping = damping  # Note: Overridden in step by constants
+        self.time = 0.0
+
+        self.coupling = 0.05  # Coupling between fast and slow fields
+
+        # Combined complex field: u[2]=u^{n-1}, u[1]=u^n, u[0]=u^{n+1}
+        self.u = np.zeros((3, ny, nx), dtype=np.complex128)
+
+        # PML absorption layer
+        self.pml = self._build_pml()
+
+        # Holographic memory (on fast field)
+        self.hologram = np.zeros((ny, nx))
+
+        # Inertial particles
+        self.particles = np.random.uniform(0, [nx, ny], (num_particles, 2))
+        self.particle_vel = np.zeros((num_particles, 2))
+        self.particle_stickiness = np.ones(num_particles) * 1.0
+
+        # Readout mechanism
+        self.readout_active = False
+        self.readout_signal = []
+        self.readout_counter = 0
+        self.readout_max_steps = 220
+        self.num_readout_points = 4
+        self.readout_history = []  # List of (signal, label)
+        self.pattern_labels = {'circle': 0, 'cross': 1, 'ring': 2}
+        self.last_pattern_type = None
+
+        # Pacemakers
+        self.num_pacemakers = num_pacemakers
+        self.pacemaker_pos = np.random.randint(50, min(nx, ny)-50, (num_pacemakers, 2))
+        self.pacemaker_freqs = np.random.uniform(0.2, 0.5, num_pacemakers)
+        self.pacemaker_amps = np.random.uniform(20, 40, num_pacemakers)
+
+        # Spiking neurons
+        self.num_neurons = num_neurons
+        self.neuron_pos = np.random.randint(50, min(nx, ny)-50, (num_neurons, 2))
+        self.spike_cooldown = np.zeros(num_neurons)
+
+        # Hologram recording for PCA
+        self.hologram_history = []
+        self.step_count = 0
+
+        # MLP for pattern classification
+        input_size = self.readout_max_steps * self.num_readout_points
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)  # 3 classes: circle, cross, ring
+        )
+        self.optimizer = optim.Adam(self.mlp.parameters(), lr=0.01)
+        self.criterion = nn.CrossEntropyLoss()
+        self.trained = False
+
+        # Engraving counter for strong hologram updates
+        self.engrave_counter = 0
+
+    def _build_pml(self):
+        """
+        Build the Perfectly Matched Layer (PML) absorption mask.
+
+        Returns:
+        - pml: 2D array for absorption (ny, nx)
+        """
+        pml = np.ones((self.ny, self.nx))
+        w = PML_WIDTH
+        sigma_x = np.zeros(self.nx)
+        for i in range(w):
+            factor = ((w - i) / w) ** PML_POWER
+            sigma_x[i] = PML_STRENGTH * factor
+            sigma_x[-1 - i] = PML_STRENGTH * factor
+        sigma_y = np.zeros(self.ny)
+        for j in range(w):
+            factor = ((w - j) / w) ** PML_POWER
+            sigma_y[j] = PML_STRENGTH * factor
+            sigma_y[-1 - j] = PML_STRENGTH * factor
+        sigma_x_grid = np.tile(sigma_x, (self.ny, 1))
+        sigma_y_grid = np.tile(sigma_y.reshape(-1, 1), (1, self.nx))
+        pml = np.exp(-np.maximum(sigma_x_grid, sigma_y_grid))
+        return pml
+
+    def drop(self, intensity=DROP_INTENSITY, width=DROP_WIDTH):
+        """
+        Add a random Gaussian drop to the fast field.
+
+        Parameters:
+        - intensity: Amplitude of the drop
+        - width: Spatial width of the drop
+        """
+        x = np.random.randint(width, self.nx - width)
+        y = np.random.randint(width, self.ny - width)
+        yy, xx = np.ogrid[-width:width, -width:width]
+        r2 = yy**2 + xx**2
+        mask = r2 < width**2
+        patch = intensity * np.exp(-r2 / (2 * width**2))
+        self.u[0, y-width:y+width, x-width:x+width].real[mask] += patch[mask]
+
+    def generate_pattern(self, ptype='circle', size=PATTERN_SIZE, amp=PATTERN_AMP):
+        """
+        Generate a 2D pattern array for addition to the field.
+
+        Parameters:
+        - ptype: Type of pattern ('circle', 'cross', 'ring')
+        - size: Size of the pattern grid
+        - amp: Amplitude of the pattern
+
+        Returns:
+        - pat: 2D array of the pattern (size, size)
+        """
+        h = size
+        yg, xg = np.ogrid[-h//2:h//2, -h//2:h//2]
+        if ptype == 'circle':
+            return (xg**2 + yg**2 < (h*0.45)**2).astype(float) * amp
+        elif ptype == 'cross':
+            pat = np.zeros((h, h))
+            pat[h//2-7:h//2+7, :] = amp
+            pat[:, h//2-7:h//2+7] = amp
+            return pat
+        elif ptype == 'ring':
+            r2 = xg**2 + yg**2
+            return ((r2 > (h*0.23)**2) & (r2 < (h*0.47)**2)).astype(float) * amp
+        return np.zeros((h, h))
+
+    def add_pattern(self, ptype='circle', cx=None, cy=None, amp=PATTERN_AMP):
+        """
+        Add a full pattern to the fast field and trigger hologram engraving.
+
+        Parameters:
+        - ptype: Pattern type
+        - cx, cy: Center coordinates (random if None)
+        - amp: Amplitude
+        """
+        if cx is None:
+            cx = np.random.randint(PATTERN_MARGIN, self.nx - PATTERN_MARGIN)
+        if cy is None:
+            cy = np.random.randint(PATTERN_MARGIN, self.ny - PATTERN_MARGIN)
+        pat = self.generate_pattern(ptype, amp=amp)
+        ph, pw = pat.shape
+        y1 = max(0, cy - ph//2)
+        y2 = min(self.ny, cy + ph//2)
+        x1 = max(0, cx - pw//2)
+        x2 = min(self.nx, cx + pw//2)
+        py1 = max(0, ph//2 - (cy - y1))
+        py2 = py1 + (y2 - y1)
+        px1 = max(0, pw//2 - (cx - x1))
+        px2 = px1 + (x2 - x1)
+        self.u[0, y1:y2, x1:x2].real += pat[py1:py2, px1:px2]
+        self.last_pattern_type = ptype
+        self.engrave_counter = ENGRAVE_DURATION
+
+    def add_partial_cue(self):
+        """
+        Add a partial (top-left quadrant) cue of the last pattern for recall.
+        """
+        if self.last_pattern_type is None:
+            print("No pattern stored yet for recall!")
+            return
+        pat = self.generate_pattern(self.last_pattern_type)
+        pat[pat.shape[0]//2:, :] = 0
+        pat[:, pat.shape[1]//2:] = 0
+        ph, pw = pat.shape
+        cy = np.random.randint(PATTERN_MARGIN, self.ny - PATTERN_MARGIN)
+        cx = np.random.randint(PATTERN_MARGIN, self.nx - PATTERN_MARGIN)
+        y1 = max(0, cy - ph//2)
+        y2 = min(self.ny, cy + ph//2)
+        x1 = max(0, cx - pw//2)
+        x2 = min(self.nx, cx + pw//2)
+        py1 = max(0, ph//2 - (cy - y1))
+        py2 = py1 + (y2 - y1)
+        px1 = max(0, pw//2 - (cx - x1))
+        px2 = px1 + (x2 - x1)
+        self.u[0, y1:y2, x1:x2].real += pat[py1:py2, px1:px2]
+        print(f"Added partial cue for {self.last_pattern_type} at random location")
+
+    def start_readout(self):
+        """
+        Start the probe readout process by activating signal collection.
+        """
+        self.readout_active = True
+        self.readout_signal = []
+        self.readout_counter = 0
+        print("Probe readout started – sending test burst...")
+
+    def step(self):
+        """
+        Perform one time step of the simulation, updating waves, pacemakers, neurons,
+        hologram, and recording for readout/PCA.
+        """
+        u = self.u
+
+        # Cycle leapfrog indices
+        u[2][:] = u[1]
+        u[1][:] = u[0]
+
+        # Compute Laplacian for interior
+        lap = (u[1, 0:-2, 1:-1] + u[1, 2:, 1:-1] +
+               u[1, 1:-1, 0:-2] + u[1, 1:-1, 2:] -
+               4 * u[1, 1:-1, 1:-1])
+        lap_f = lap.real
+        lap_s = lap.imag
+
+        # Interior views
+        u1_int = u[1, 1:-1, 1:-1]
+        u2_int = u[2, 1:-1, 1:-1]
+        u0_int = u[0, 1:-1, 1:-1]
+        u_f1 = u1_int.real
+        u_s1 = u1_int.imag
+        u_f2 = u2_int.real
+        u_s2 = u2_int.imag
+
+        # Linear wave update for fast field, modulated by slow
+        c2_local_fast = self.alpha2_fast * (1 + self.coupling * u_s1)
+        u0_int.real = c2_local_fast * lap_f + 2 * u_f1 - u_f2
+
+        # Slow field update
+        u0_int.imag = self.alpha2_slow * lap_s + 2 * u_s1 - u_s2 + self.coupling * lap_f
+
+        # Hologram modulation on fast field
+        if np.any(self.hologram != 0):
+            mod = HOLO_MOD_STRENGTH * self.hologram[1:-1, 1:-1]
+            u0_int.real += mod * lap_f
+
+        # Cubic nonlinearity on fast field (softened with tanh)
+        u3 = u_f1**3
+        u0_int.real += NONLINEAR_COEFF * np.tanh(u3 / NONLINEAR_SOFTEN_DIV) * NONLINEAR_SOFTEN_DIV
+
+        # Apply damping
+        u0_int.real *= DAMPING_FAST
+        u0_int.imag *= DAMPING_SLOW
+
+        # Apply PML absorption
+        u[0] *= self.pml
+
+        # Soft saturation clipping
+        limit = FIELD_LIMIT
+        u0_real = u[0].real
+        u0_imag = u[0].imag
+        u[0].real = u0_real * limit / (limit + np.abs(u0_real))
+        u[0].imag = u0_imag * limit / (limit + np.abs(u0_imag))
+
+        # Increment time
+        self.time += TIME_STEP
+
+        # Add pacemaker sources
+        for i in range(self.num_pacemakers):
+            px, py = self.pacemaker_pos[i]
+            source = self.pacemaker_amps[i] * np.sin(self.pacemaker_freqs[i] * self.time)
+            radius = PACEMAKER_RADIUS
+            yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+            mask = (xx**2 + yy**2 <= radius**2)
+            y_start = max(0, py - radius)
+            x_start = max(0, px - radius)
+            patch_size_y, patch_size_x = mask.shape
+            patch = source * np.exp(-(xx**2 + yy**2) / (2 * radius**2))[mask]
+            self.u[0, y_start:y_start+patch_size_y, x_start:x_start+patch_size_x].real[mask] += patch
+
+        # Probe injection and readout recording
+        if self.readout_active:
+            probe_source = READOUT_PROBE_AMP * np.sin(READOUT_PROBE_OMEGA * self.time) * max(0.0, np.exp(-self.readout_counter / READOUT_DECAY_TAU))
+            self.u[0, :, 0:READOUT_PROBE_WIDTH].real += probe_source
+            self.readout_counter += 1
+            if self.readout_counter >= self.readout_max_steps:
+                self.readout_active = False
+                sig = np.array(self.readout_signal).flatten()
+                if self.last_pattern_type is not None:
+                    label = self.pattern_labels[self.last_pattern_type]
+                    self.readout_history.append((sig, label))
+                    peak = np.max(np.abs(sig))
+                    print(f"Readout finished for {self.last_pattern_type} → Peak: {peak:.3f}, Signal collected")
+                    if self.trained:
+                        pred = self.predict_pattern(self.readout_signal)
+                        print(f"MLP prediction: {pred}")
+                else:
+                    print("Readout finished but no pattern label")
+
+        if self.readout_active:
+            right_response = self.u[0, :, -1].real
+            means = []
+            segment_size = self.ny // self.num_readout_points
+            for i in range(self.num_readout_points):
+                start = i * segment_size
+                end = (i + 1) * segment_size if i < self.num_readout_points - 1 else self.ny
+                means.append(np.mean(np.abs(right_response[start:end])))
+            self.readout_signal.append(means)
+
+        # Process neuron spikes
+        for i in range(self.num_neurons):
+            if self.spike_cooldown[i] > 0:
+                self.spike_cooldown[i] -= 1
+                continue
+            py, px = self.neuron_pos[i]
+            if abs(self.u[0, py, px].real) > SPIKE_THRESHOLD:
+                radius = NEURON_RADIUS
+                yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+                mask = (xx**2 + yy**2 <= radius**2)
+                y_start = max(0, py - radius)
+                x_start = max(0, px - radius)
+                impulse_patch = SPIKE_IMPULSE * np.exp(-(xx**2 + yy**2) / (2 * radius**2))[mask]
+                patch_size_y, patch_size_x = mask.shape
+                self.u[0, y_start:y_start+patch_size_y, x_start:x_start+patch_size_x].real[mask] += impulse_patch
+                dists = np.linalg.norm(self.pacemaker_pos - np.array([px, py]), axis=1)
+                nearest = np.argmin(dists)
+                self.pacemaker_amps[nearest] *= PACEMAKER_BOOST_FACTOR
+                self.pacemaker_amps[nearest] = min(self.pacemaker_amps[nearest], PACEMAKER_AMP_CAP)
+                self.spike_cooldown[i] = SPIKE_COOLDOWN
+                print(f"Spike at neuron {i}! Boosted pacemaker {nearest}")
+
+        # Update hologram with interference
+        rate = HOLO_WRITE_RATE
+        if self.engrave_counter > 0:
+            rate *= ENGRAVE_BOOST_FACTOR
+            self.engrave_counter -= 1
+        interference = self.u[0].real * self.u[1].real
+        energy = np.sqrt(self.u[0].real**2 + self.u[1].real**2 + 1e-8)
+        interference /= energy
+        self.hologram += rate * interference
+        self.hologram = np.tanh(self.hologram / HOLO_SATURATION) * HOLO_SATURATION
+        self.hologram *= HOLO_DECAY
+
+        # Add periodic noise
+        self.step_count += 1
+        if self.step_count % NOISE_INTERVAL == 0:
+            self.u[0].real += np.random.normal(0, NOISE_SCALE, (self.ny, self.nx))
+
+        # Record hologram for PCA
+        if self.step_count % RECORD_EVERY == 0:
+            self.hologram_history.append(self.hologram.flatten().copy())
+            if len(self.hologram_history) > 50:
+                self.hologram_history.pop(0)
+
+    def update_particles(self):
+        """
+        Update particle dynamics based on wave field gradients and advection.
+        """
+        potential = self.u[0].real ** 2 + 0.5 * self.u[0].imag ** 2
+        gy, gx = np.gradient(potential)
+        du = self.u[0].real - self.u[1].real
+        jitter_scale = PARTICLE_JITTER_SCALE / np.sqrt(self.particle_stickiness + PARTICLE_JITTER_DENOM_OFFSET)
+        jitter = np.random.randn(self.particles.shape[0], 2) * jitter_scale[:, np.newaxis]
+        update_particles_jit(self.particles, self.particle_vel, self.particle_stickiness, potential, gy, gx, du, jitter, self.nx, self.ny)
+
+    def perform_pca(self):
+        """
+        Perform PCA on accumulated hologram history and visualize the first component.
+        """
+        if len(self.hologram_history) < 5:
+            print("Not enough hologram history for PCA")
+            return
+        hist = np.array(self.hologram_history)
+        pca = PCA(n_components=PCA_N_COMPONENTS)
+        self.pca_components = pca.fit_transform(hist)
+        print("PCA performed on hologram history")
+        print("Explained variance ratio:", pca.explained_variance_ratio_)
+        fig_pca = plt.figure()
+        plt.imshow(pca.components_[0].reshape(self.ny, self.nx), cmap='viridis')
+        plt.title("First PCA Component of Holograms")
+        plt.show()
+
+    def train_mlp(self):
+        """
+        Train the MLP classifier on collected readout signals.
+        """
+        if len(self.readout_history) < 3:
+            print("Not enough readout data to train MLP (need at least one per class ideally)")
+            return
+        X = np.array([sig for sig, _ in self.readout_history])
+        y = np.array([label for _, label in self.readout_history])
+        X_tensor = torch.from_numpy(X).float()
+        y_tensor = torch.from_numpy(y).long()
+
+        for epoch in range(200):
+            self.optimizer.zero_grad()
+            out = self.mlp(X_tensor)
+            loss = self.criterion(out, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+            if epoch % 50 == 0:
+                print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+        self.trained = True
+        print("MLP trained on readout signals")
+
+    def predict_pattern(self, signal):
+        """
+        Predict pattern class using trained MLP.
+
+        Parameters:
+        - signal: List of readout means
+
+        Returns:
+        - Predicted pattern name or "Unknown"
+        """
+        if not self.trained:
+            print("MLP not trained yet")
+            return None
+        sig_tensor = torch.from_numpy(np.array(signal).flatten()).float().unsqueeze(0)
+        out = self.mlp(sig_tensor)
+        pred = torch.argmax(out).item()
+        patterns = {v: k for k, v in self.pattern_labels.items()}
+        return patterns.get(pred, "Unknown")
+
+
+if __name__ == "__main__":
+    sim = WaveBrainSimulator(nx=380, ny=380, num_particles=6800)
+
+    fig, ax = plt.subplots(figsize=(9.5, 9.5), facecolor='black')
+    ax.axis('off')
+    img = ax.imshow(sim.u[0].real, cmap='plasma', vmin=-72, vmax=125,
+                    interpolation='bilinear')
+
+    sc = ax.scatter(sim.particles[:, 0], sim.particles[:, 1],
+                    s=1.1, c=sim.particle_stickiness, cmap='hot',
+                    vmin=0.7, vmax=7.8, alpha=0.9, linewidth=0)
+
+    # Hologram inset
+    ax_holo = fig.add_axes([0.75, 0.75, 0.22, 0.22])
+    ax_holo.axis('off')
+    img_holo = ax_holo.imshow(sim.hologram, cmap='viridis',
+                              vmin=-35, vmax=35, interpolation='bilinear', alpha=0.7)
+
+    # Slow field inset
+    ax_slow = fig.add_axes([0.05, 0.75, 0.22, 0.22])
+    ax_slow.axis('off')
+    img_slow = ax_slow.imshow(sim.u[0].imag, cmap='coolwarm', vmin=-50, vmax=50,
+                              interpolation='bilinear', alpha=0.7)
+
+    def animate(frame):
+        if np.random.rand() < DROP_PROB:
+            sim.drop()
+
+        sim.step()
+        sim.update_particles()
+
+        img.set_data(sim.u[0].real)
+        num_plot = int(len(sim.particles) * PARTICLE_PLOT_FRACTION)
+        idx = np.random.choice(len(sim.particles), num_plot, replace=False)
+        sc.set_offsets(sim.particles[idx])
+        sc.set_array(sim.particle_stickiness[idx])
+        sc.set_sizes(PARTICLE_SIZE_BASE + sim.particle_stickiness[idx] * PARTICLE_SIZE_SCALE)
+        img_holo.set_data(sim.hologram)
+        img_slow.set_data(sim.u[0].imag)
+
+        return [img, sc, img_holo, img_slow]
+
+    ani = FuncAnimation(fig, animate, interval=16, blit=True, cache_frame_data=False)
+
+    def on_key(event):
+        if event.key == '1':
+            sim.add_pattern('circle')
+            print("Added circle pattern (engraving hologram)")
+        elif event.key == '2':
+            sim.add_pattern('cross')
+            print("Added cross pattern (engraving hologram)")
+        elif event.key == '3':
+            sim.add_pattern('ring')
+            print("Added ring pattern (engraving hologram)")
+        elif event.key == 'd':
+            for _ in range(10):
+                sim.drop()
+            print("10 random drops")
+        elif event.key == 'r':
+            sim.add_partial_cue()
+        elif event.key == 'p':
+            sim.start_readout()
+        elif event.key == 'c':
+            sim.perform_pca()
+        elif event.key == 't':
+            sim.train_mlp()
+        elif event.key == 'q':
+            plt.close()
+
+    fig.canvas.mpl_connect('key_press_event', on_key)
+
+    print("Enhanced Hybrid WaveBrainSimulator running")
+    print("Keys: 1=circle  2=cross  3=ring  d=10 drops  r=partial recall  p=probe readout  c=PCA on holograms  t=train MLP  q=quit")
+    plt.tight_layout()
+    plt.show()
