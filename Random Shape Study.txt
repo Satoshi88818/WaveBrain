@@ -1,0 +1,210 @@
+Random Shape Study
+
+bash
+
+cd /home/squire/wavebrain_project; cat > tests/test_randstudy.py << 'EOF'
+"""Tests for the random-shape study: engineered baselines, arms, cache, the pre-registered
+verdict (every branch) and the end-to-end runner."""
+import json
+from dataclasses import asdict
+
+import numpy as np
+import pytest
+
+import wavebrain.randstudy as rs
+from wavebrain.classifier import cross_val_accuracy
+from wavebrain.randshapes import RandDataset, build_rand_raw
+from wavebrain.randstudy import (BASELINE_SETS, GENERIC_BASELINE, fft_absdiff_features, format_report,
+                                 get_rand_dataset, load_rand, main, paired_vs, rand_arm_config,
+                                 rand_key, run_rand_study, save_rand, verdict)
+from wavebrain.readouts import READOUTS, make_readout
+from wavebrain.study import ARMS, evaluate_readout
+
+
+def cv(X, y, name, repeats=2):
+    return float(np.mean([cross_val_accuracy(X, y, 5, s, make_readout(name)) for s in range(repeats)]))
+
+
+# ------------------------------------------- engineered baselines (no simulation)
+@pytest.fixture(scope="module")
+def raw240():
+    return build_rand_raw(rand_arm_config("FULL", 1000, 240))
+
+
+def test_absdiff_oracle_is_exactly_zero_for_same_shapes_at_any_placement(raw240):
+    raw, y = raw240
+    F = fft_absdiff_features(raw)
+    assert (F >= 0).all() and F[y == 1].max() < 1e-9                  # jitter-invariant, exact
+    assert (F[y == 0].sum(1) > 1.0).all()                             # different shapes are visible
+
+
+def test_hard_wired_comparator_solves_the_task_but_generic_linear_features_cannot(raw240):
+    raw, y = raw240
+    assert cv(fft_absdiff_features(raw), y, "linear") > 0.90
+    for name in ("raw", "pooled", "fft_concat"):
+        assert cv(BASELINE_SETS[name](raw), y, "linear") < 0.65, name  # no comparison without a rule
+
+
+def test_equal_energy_gives_quadratic_readouts_a_shortcut_on_generic_fft_features(raw240):
+    """Documented property of the task: because every shape has the same energy, sum(F_top * F_bottom)
+    separates same from different, so degree-2 readouts learn the rule from examples.  The medium
+    therefore faces a STRONG generic baseline; this test guards that property."""
+    raw, y = raw240
+    assert cv(BASELINE_SETS[GENERIC_BASELINE](raw), y, "poly2") > 0.75
+
+
+# -------------------------------------------------------------------- arms
+def test_arms_differ_only_in_the_hologram_flag_and_share_the_trials():
+    ref = asdict(rand_arm_config("FULL", 3, 24))
+    for arm, (holo, _) in ARMS.items():
+        d = asdict(rand_arm_config(arm, 3, 24))
+        assert d["base"]["use_hologram"] == holo
+        d["base"]["use_hologram"] = ref["base"]["use_hologram"]
+        assert d == ref
+    with pytest.raises(ValueError):
+        rand_arm_config("BOGUS", 0, 24)
+    assert len({rand_key(rand_arm_config("FULL", s, 24), c) for s in (0, 1) for c in (False, True)}) == 4
+
+
+# --------------------------------------------------------------------- cache
+def _fake(cfg, seed=0):
+    rng = np.random.default_rng(seed)
+    y = np.array([1 - (i % 2) for i in range(cfg.n_trials)])
+    return RandDataset(cfg.base, rng.normal(size=(cfg.n_trials, 24, 360)), y, rng.normal(size=(cfg.n_trials, 3200)),
+                       {"clip_events": 0, "peak_u": 1.0, "write_rms": 0.2, "hologram_max_mean": 0.3,
+                        "seconds": 1.0, "response_rms": 0.03})
+
+
+def test_cache_roundtrip_stale_rejection_and_rebuild(tmp_path, monkeypatch):
+    cfg = rand_arm_config("FULL", 0, 24)
+    ds = _fake(cfg)
+    path = tmp_path / "x.npz"
+    save_rand(ds, path, cfg, False)
+    back = load_rand(path, cfg, False)
+    np.testing.assert_array_equal(back.responses, ds.responses); assert back.stats == ds.stats
+    with pytest.raises(ValueError, match="stale"):
+        load_rand(path, rand_arm_config("FULL", 1, 24), False)
+    with pytest.raises(ValueError, match="stale"):
+        load_rand(path, cfg, True)
+
+    calls = []
+    monkeypatch.setattr(rs, "build_rand_dataset", lambda c, clear, verbose=False: (calls.append(clear), _fake(c, len(calls)))[1])
+    _, c1 = get_rand_dataset("HOLO_ONLY", 0, 24, tmp_path)
+    _, c2 = get_rand_dataset("HOLO_ONLY", 0, 24, tmp_path)
+    assert (c1, c2) == (False, True) and calls == [True]
+    other = rand_arm_config("FULL", 9, 24)
+    save_rand(_fake(other), tmp_path / "rand_HOLO_ONLY_seed0_n24.npz", other, False)   # stale content
+    assert get_rand_dataset("HOLO_ONLY", 0, 24, tmp_path)[1] is False and len(calls) == 2
+
+
+# ------------------------------------------------------------ paired comparison
+def test_paired_vs_uses_the_bonferroni_level_and_detects_a_gain(monkeypatch):
+    rng = np.random.default_rng(0)
+    X = np.zeros((120, 6)); y = np.array([1 - (i % 2) for i in range(120)])
+    good = np.hstack([y[:, None] * 2.0 - 1.0 + rng.normal(0, 0.1, (120, 1)), rng.normal(size=(120, 5))])
+    noise = rng.normal(size=(120, 6))
+    a = {r: evaluate_readout(good, y, r, 0, 0) for r in READOUTS}
+    b = {r: evaluate_readout(noise, y, r, 0, 0) for r in READOUTS}
+    out = paired_vs(a, b, seed=0, readouts=READOUTS)
+    assert all(out[r]["diff"] > 0.3 and out[r]["lo"] > 0 for r in READOUTS)
+    seen = []
+    real = rs.paired_bootstrap_diff
+    monkeypatch.setattr(rs, "paired_bootstrap_diff", lambda x, y_, **kw: (seen.append(kw["level"]), real(x, y_, **kw))[1])
+    paired_vs(a, b, seed=0, readouts=READOUTS)
+    assert seen == [pytest.approx(1 - 0.05 / 4)] * 4
+
+
+# -------------------------------------------------------- verdict (pre-registered)
+def _cell(acc, p):
+    return {"acc": acc, "ci_low": acc - 0.1, "ci_high": acc + 0.1, "p_perm": p}
+
+
+def _sres(full_acc=0.80, full_p=0.01, null_p=0.6, lo=0.1, hi=0.3, clips=0, n_perm=100, oracle=0.95,
+          drop=()):
+    rd = ("linear", "rbf", "poly2", "quadpca")
+    arm = lambda acc, p, clip=0: {"same_diff": {r: _cell(acc, p) for r in rd}, "stats": {"clip_events": clip}}
+    arms = {"FULL": arm(full_acc, full_p, clips), "NULL": arm(0.5, null_p),
+            "HOLO_ONLY": arm(0.6, 0.2), "RING_ONLY": arm(0.6, 0.2)}
+    base = {"fft_concat": {r: _cell(0.6, 0.05) for r in rd}, "fft_absdiff": {r: _cell(oracle, 0.01) for r in rd}}
+    for d in drop:
+        (arms if d in arms else base).pop(d)
+    paired = {"fft_concat": {r: {"diff": 0.0, "lo": lo, "hi": hi} for r in rd}}
+    return {"arms": arms, "baselines": base, "paired": paired, "n_perm": n_perm}
+
+
+def test_verdict_invalid_missing_and_untestable():
+    assert verdict(_sres(clips=1))["outcome"] == "INVALID_CLIPPED"
+    assert verdict(_sres(drop=("NULL",)))["outcome"] == "INCONCLUSIVE"
+    assert verdict(_sres(drop=("fft_concat",)))["outcome"] == "INCONCLUSIVE"
+    low = verdict(_sres(n_perm=20))
+    assert low["outcome"] == "INCONCLUSIVE" and "permutations" in low["text"]
+    assert verdict(_sres(n_perm=79))["outcome"] != "INCONCLUSIVE"        # 1/80 = alpha / 4 exactly
+
+
+def test_verdict_control_fails_and_no_signal():
+    r = verdict(_sres(null_p=0.004))
+    assert r["outcome"] == "CONTROL_FAILS" and "leaks" in r["text"]
+    assert verdict(_sres(full_p=0.3))["outcome"] == "MEDIUM_NO_SIGNAL"
+
+
+def test_verdict_medium_wins_needs_accuracy_significance_and_a_positive_paired_interval():
+    win = verdict(_sres())
+    assert win["outcome"] == "MEDIUM_WINS" and "Hard-wired comparator" in win["text"]
+    assert verdict(_sres(full_acc=0.60))["outcome"] == "NO_ADVANTAGE"       # below min_acc
+    assert verdict(_sres(lo=-0.01))["outcome"] == "NO_ADVANTAGE"            # interval includes 0
+    assert verdict(_sres(lo=-0.3, hi=-0.05))["outcome"] == "BASELINE_BETTER"
+    assert verdict(_sres(lo=-0.3, hi=0.05))["outcome"] == "NO_ADVANTAGE"
+
+
+# -------------------------------------------------------------------- end to end
+@pytest.fixture(scope="module")
+def tiny_run(tmp_path_factory):
+    cache = tmp_path_factory.mktemp("rcache")
+    kw = dict(n_trials=24, seeds=(3,), arms=("FULL", "NULL"), n_perm=3, cache_dir=cache, verbose=False)
+    return run_rand_study(**kw), kw, cache
+
+
+def test_run_rand_study_structure_null_identity_and_determinism(tiny_run):
+    res, kw, cache = tiny_run
+    s = res["seeds"][3]
+    assert set(s["arms"]) == {"FULL", "NULL"} and set(s["baselines"]) == set(BASELINE_SETS)
+    assert s["arms"]["NULL"]["stats"]["clean_spread"] == 0.0               # identical trials
+    assert s["arms"]["FULL"]["stats"]["clean_spread"] > 1e-4
+    assert set(s["paired"]) == {"fft_concat", "pooled", "raw"}
+    assert s["verdict"]["outcome"] == "INCONCLUSIVE"                       # 3 permutations are too few
+    again = run_rand_study(**kw)
+    assert again["seeds"][3]["from_cache"] == {"FULL": True, "NULL": True}
+    assert again["seeds"][3]["arms"]["FULL"]["same_diff"]["rbf"]["acc"] == s["arms"]["FULL"]["same_diff"]["rbf"]["acc"]
+
+
+def test_report_and_cli(tiny_run, tmp_path):
+    res, kw, cache = tiny_run
+    text = format_report(res)
+    for needle in ("VERDICT (seed 3)", "ORACLE", "paired accuracy difference", "COMBINED", "generic"):
+        assert needle in text
+    out = tmp_path / "r.json"
+    assert main(["--trials", "24", "--seeds", "3", "--arms", "FULL,NULL", "--perms", "3",
+                 "--cache", str(cache), "--json", str(out)]) == 0
+    data = json.loads(out.read_text())
+    assert "3" in data["seeds"] and "_correct" not in out.read_text()
+EOF
+python3 -m pytest tests/test_randstudy.py 2>&1 | tail -15; echo ---; cat /tmp/tune_rand.txt | cut -c1-170
+Output
+
+        assert set(s["arms"]) == {"FULL", "NULL"} and set(s["baselines"]) == set(BASELINE_SETS)
+        assert s["arms"]["NULL"]["stats"]["clean_spread"] == 0.0               # identical trials
+        assert s["arms"]["FULL"]["stats"]["clean_spread"] > 1e-4
+        assert set(s["paired"]) == {"fft_concat", "pooled", "raw"}
+>       assert s["verdict"]["outcome"] == "INCONCLUSIVE"                       # 3 permutations are too few
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: assert 'INVALID_CLIPPED' == 'INCONCLUSIVE'
+E         
+E         - INCONCLUSIVE
+E         + INVALID_CLIPPED
+
+tests/test_randstudy.py:169: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_randstudy.py::test_run_rand_study_structure_null_identity_and_determinism
+1 failed, 10 passed in 31.38s
+---
+[seed 1000] FULL      linear=0.439  rbf=0.503  poly2=0.456  quadpca=0.536
