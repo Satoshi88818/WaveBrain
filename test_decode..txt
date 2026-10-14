@@ -1,0 +1,36 @@
+bash
+
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+p='tests/test_decode.py'; s=open(p).read()
+start=s.index("def test_paired_comparison_uses_the_family_level"); end=s.index("def test_noise_multiplier_scales_the_added_noise")
+new='''def test_paired_comparison_uses_the_family_level(tiny, monkeypatch):
+    res, kw, cache = tiny
+    seen = []
+    real = dec.bootstrap_r2
+
+    def spy(E_a, Y, E_b=None, n_boot=2000, seed=0, level=0.95):
+        seen.append((E_b is not None, level))
+        return real(E_a, Y, E_b, n_boot, seed, level)
+
+    monkeypatch.setattr(dec, "bootstrap_r2", spy)
+    run_decoding(**{**kw, "noise_multipliers": (1.0,)})
+    paired_levels = [lv for paired, lv in seen if paired]
+    assert paired_levels and all(lv == pytest.approx(0.975) for lv in paired_levels)     # 1 medium arm x 2 readouts
+
+
+'''
+s=s[:start]+new+s[end:]
+open(p,'w').write(s)
+EOF
+python3 -m pytest tests/test_decode.py 2>&1 | tail -3
+md5sum wavebrain/*.py > /tmp/code_at_decode_final.txt
+setsid nohup python3 -m wavebrain.decode --trials 240 --seeds 0,1 --cache /home/claude/cache_rand_final --boot 2000 --json decode_results.json > decode_output.txt 2>&1 < /dev/null &
+sleep 150; sed -n '1,4p' /home/claude/wavebrain_project/decode_output.txt | cut -c1-200
+Output
+
+................                                                         [100%]
+16 passed in 16.57s
+[seed 0] SHAPES_DECODABLE: Shapes are decodable from the medium (best: RING_ONLY/rbf, R2 = 0.24; arms: ['FULL', 'RING_ONLY']).
+[seed 1] SHAPES_DECODABLE: Shapes are decodable from the medium (best: RING_ONLY/rbf, R2 = 0.26; arms: ['FULL', 'RING_ONLY']).
+
+WaveBrain shape-decoding diagnostic (trials=240, seeds=[0, 1], 4 descriptors per shape explaining 58% of descriptor variance, min R2 0.1)
