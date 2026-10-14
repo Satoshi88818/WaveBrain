@@ -1,0 +1,282 @@
+cd /home/squire/wavebrain_project; md5sum wavebrain/*.py > /tmp/v11_hashes.txt; wc -l < /tmp/v11_hashes.txt; ls /home/squire/cache_state_final | wc -l; ls /tmp/cache_state_tune | wc -l
+cat > wavebrain/modmap.py << 'EOF'
+"""Does the probe's access to the stored state explain what it recovers?   ``python -m wavebrain.modmap``
+
+v11 decoded shapes from the stored state (hologram H, fast field u, slow field s) with no probe
+and no noise: H partly (R2 about 0.35), the fields much better (about 0.6), while the probe path
+recovered only 0.22.  It left a HYPOTHESIS: the probe couples to the medium through the local wave
+speed, c2 = c0 * (1 + slow_mod * s + holo_mod * H), while the linear effect of the fast field is
+removed by the paired baseline subtraction.  This module tests it on the cached state arrays (no new
+simulation) and makes the comparison amplitude-aware.
+
+* ``mod``       slow_mod * s + holo_mod * H of the FULL arm: what the probe couples to (before the clip)
+* ``mod_s``     slow_mod * s alone;   ``mod_H``  holo_mod * H alone
+* ``mod_ring``  slow_mod * s of the hologram-off arm (what the probe can see in RING_ONLY)
+* ``u_full``, ``u_ring``  the fast fields (invisible to the probe at first order)
+* ``NULL``      zeros: the negative control (noise only)
+
+Readout noise is added to the pooled values at multiples of the sensor noise (0.015), the same noise
+realisation for every state, so a small, decaying signal loses information fairly.
+
+Pre-registered decision rule: see ``verdict``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+
+from .decode import (DECODE_READOUTS, bootstrap_r2, make_regressor, position_targets, r2_per_output,
+                     shape_basis, shape_targets, squared_errors)
+from .pilot import strip_private
+from .randshapes import build_rand_raw
+from .randstudy import BASELINE_SETS, rand_arm_config
+from .statedecode import (POSITIVE_CONTROL_R2, STATE_CONTROL_MIN, build_written_maps, get_state_arrays,
+                          load_probe_reference, sub_indices)
+from .study import combine_verdicts
+
+NOISE_MULTS = (0.0, 1.0, 4.0, 16.0)
+BASE_NOISE = 0.015                      # sensor noise std per raw sample (ExperimentConfig.sensor_noise)
+BAND = 0.10                             # "about equal to the probe" tolerance
+MIN_R2 = 0.10
+STATES = ("mod", "mod_s", "mod_H", "mod_ring", "u_full", "u_ring")
+VARIANTS = ("pool4", "sub24")
+PRIMARY_MULT = "1.0"
+
+
+# -------------------------------------------------------------------- features
+def build_features(full: dict, ring: dict, medium) -> dict:
+    """The probe-visible modulation maps and the fast fields, from the cached pooled state arrays."""
+    sm, hm = medium.slow_mod, medium.holo_mod
+    return {"mod": sm * full["s"] + hm * full["H"], "mod_s": sm * full["s"], "mod_H": hm * full["H"],
+            "mod_ring": sm * ring["s"], "u_full": full["u"], "u_ring": ring["u"],
+            "NULL": np.zeros_like(full["H"])}
+
+
+def add_noise(X: np.ndarray, mult: float, seed: int, idx: int) -> np.ndarray:
+    """Gaussian readout noise of std BASE_NOISE * mult; the SAME realisation for every state at a
+    given (seed, idx), so differences between states are differences of signal only."""
+    if mult == 0.0:
+        return X
+    return X + BASE_NOISE * mult * np.random.default_rng([seed, 99, idx]).normal(size=X.shape)
+
+
+# --------------------------------------------------------------------- verdict
+def best(sres: dict, name: str, mult: str, variant: str) -> tuple[float, str]:
+    """(best R2 over readouts, counted only if its paired interval versus NULL is above 0; readout)."""
+    cells = sres["states"][name][mult][variant]
+    r = max(cells, key=lambda k: cells[k]["r2"])
+    c = cells[r]
+    return (c["r2"] if c["diff_vs_null"]["lo"] > 0 else 0.0), r
+
+
+def verdict(sres: dict, mult: str = PRIMARY_MULT) -> dict:
+    """Pre-registered decision rule (fixed before the reported runs), applied per seed.
+
+    0. INVALID_CLIPPED          the safety clip fired.
+    -  INCONCLUSIVE             ``mod`` or NULL missing.
+    1. POSITIVE_CONTROL_FAILS   Fourier features do not decode the descriptors (R2 < 0.95).
+    2. CONTROL_FAILS            NULL (zeros plus noise) has R2 > 0.05 anywhere: a leak.
+    3. STATE_CONTROL_FAILS      the pooled written map does not decode placement (R2 < 0.25).
+    Then, with m = best R2 of the modulation map ``mod`` (counted only if its interval versus NULL is
+    above 0) at readout noise ``mult`` x the sensor noise, m_sub the same from only 24 values, and
+    p = the v10 probe-based R2 of the same trials (BAND = 0.10):
+    4. PROBE_PATH_LOSSY         m_sub >= p + BAND: even 24 values of the map hold more shape information
+                                than the probe recovers: the probe readout is inefficient beyond bandwidth.
+       BANDWIDTH_LIMITED        m >= p + BAND but m_sub < p + BAND: the probe recovers about what 24 values
+                                hold; more sensors are what is missing.
+       PROBE_EXPLAINED          |m - p| < BAND: the probe gets what the modulation map holds.
+       PROBE_BEATS_MODULATION   m <= p - BAND: the probe recovers more than the map holds: it uses other
+                                channels, and the first-order picture is incomplete.
+       NO_PROBE_REFERENCE       no probe R2 supplied.
+    Qualifiers: ``channel`` (which part of the map carries shape, R2 >= 0.10: slow / hologram / both /
+    neither) and ``fast`` (fast-visible / fast-buried: u_full at this noise).
+    """
+    st = sres["states"]
+    if sres["clip_events"] > 0:
+        return {"outcome": "INVALID_CLIPPED", "text": "Safety clip fired in the cached state arrays.",
+                "next": "Lower the drive and regenerate the state arrays."}
+    if "mod" not in st or "NULL" not in st:
+        return {"outcome": "INCONCLUSIVE", "text": "Needs mod and NULL.", "next": "Run with both."}
+    pc = sres["baselines"]["fft_concat"]["shape"]["linear"]["r2"]
+    if pc < POSITIVE_CONTROL_R2:
+        return {"outcome": "POSITIVE_CONTROL_FAILS",
+                "text": f"Fourier features decode the descriptors with R2 = {pc:.3f} < {POSITIVE_CONTROL_R2}.",
+                "next": "Fix the target construction first."}
+    leaks = [(m, v, r) for m in st["NULL"] for v in VARIANTS for r, c in st["NULL"][m][v].items() if c["r2"] > 0.05]
+    if leaks:
+        return {"outcome": "CONTROL_FAILS", "text": f"NULL (noise only) has R2 > 0.05 for {leaks[:3]}: a leak.",
+                "next": "Find and remove the leaking channel first."}
+    mp = max(c["r2"] for c in sres["baselines"]["map"]["position"].values())
+    if mp < STATE_CONTROL_MIN:
+        return {"outcome": "STATE_CONTROL_FAILS",
+                "text": f"The pooled written map decodes placement with R2 = {mp:.2f} < {STATE_CONTROL_MIN}.",
+                "next": "Fix the pipeline first."}
+    m, rm = best(sres, "mod", mult, "pool4")
+    m_sub, _ = best(sres, "mod", mult, "sub24")
+    s_r = best(sres, "mod_s", mult, "pool4")[0]
+    h_r = best(sres, "mod_H", mult, "pool4")[0]
+    channel = ("both" if s_r >= MIN_R2 and h_r >= MIN_R2 else "slow" if s_r >= MIN_R2
+               else "hologram" if h_r >= MIN_R2 else "neither")
+    u = best(sres, "u_full", mult, "pool4")[0]
+    fast = "fast-visible" if u >= MIN_R2 else "fast-buried"
+    tail = (f" Modulation map at noise x{mult}: R2 = {m:.2f} (24 values: {m_sub:.2f}); slow part {s_r:.2f}, "
+            f"hologram part {h_r:.2f}; fast field {u:.2f}.")
+    p = sres.get("probe_r2")
+    base = {"channel": channel, "fast": fast}
+    if p is None:
+        return {"outcome": "NO_PROBE_REFERENCE", **base, "text": "No probe R2 supplied." + tail,
+                "next": "Provide the v10 decode_results.json."}
+    if m_sub >= p + BAND:
+        return {"outcome": "PROBE_PATH_LOSSY", **base,
+                "text": f"24 values of the modulation map hold R2 = {m_sub:.2f}, more than the probe's {p:.2f}: the "
+                        f"probe readout is inefficient beyond bandwidth." + tail,
+                "next": "Improve the probe/readout (longer or stronger probe, better features) before adding sensors."}
+    if m >= p + BAND:
+        return {"outcome": "BANDWIDTH_LIMITED", **base,
+                "text": f"The map holds R2 = {m:.2f}, but 24 values hold {m_sub:.2f}, about the probe's {p:.2f}: "
+                        f"channel count is what is missing." + tail,
+                "next": "Simulate with more sensors (48 or 96) and re-decode."}
+    if m >= p - BAND:
+        return {"outcome": "PROBE_EXPLAINED", **base,
+                "text": f"The modulation map holds R2 = {m:.2f}, about the probe's {p:.2f}: the probe gets what "
+                        f"the map holds." + tail,
+                "next": "The limit is the stored information itself; improve what is written (drive, plasticity)."}
+    return {"outcome": "PROBE_BEATS_MODULATION", **base,
+            "text": f"The probe recovers {p:.2f}, more than the modulation map holds ({m:.2f}): it uses other "
+                    f"channels and the first-order picture is incomplete." + tail,
+            "next": "Decode from the fast field's parametric effects and nonlinear terms."}
+
+
+# ------------------------------------------------------------------- the study
+def run_modmap(n_trials: int = 240, seeds=(0, 1), readouts=DECODE_READOUTS, noise_mults=NOISE_MULTS,
+               cache_dir=None, probe_json=None, probe_r2=None, statedecode_json=None, n_boot: int = 2000,
+               k: int = 5, repeats: int = 3, verbose: bool = True) -> dict:
+    t0 = time.time()
+    basis = shape_basis()
+    res = {"config": {"n_trials": n_trials, "seeds": list(seeds), "readouts": list(readouts),
+                      "noise_mults": list(noise_mults), "base_noise": BASE_NOISE, "band": BAND, "n_boot": n_boot},
+           "seeds": {}}
+    for seed in seeds:
+        cfg = rand_arm_config("FULL", seed, n_trials)
+        Y = shape_targets(cfg, basis)
+        full, _ = get_state_arrays("FULL", seed, n_trials, cache_dir, verbose)
+        ring, _ = get_state_arrays("RING_ONLY", seed, n_trials, cache_dir, verbose)
+        feats = build_features(full, ring, cfg.base.medium)
+        idx = sub_indices(full["H"].shape[1])
+        level = 1.0 - 0.05 / (len(STATES) * len(readouts))
+        E = {}
+        for mi, mult in enumerate(noise_mults):
+            for n, X in feats.items():
+                Xn = add_noise(X, mult, seed, mi)
+                for v in VARIANTS:
+                    for r in readouts:
+                        E[(n, str(mult), v, r)] = squared_errors(Xn if v == "pool4" else Xn[:, idx], Y,
+                                                                 make_regressor(r), k, repeats, seed)
+        sres = {"states": {}, "baselines": {}, "family_level": level, "clip_events": float(full["clip_events"] + ring["clip_events"]),
+                "probe_r2": None}
+        if probe_json:
+            sres["probe_r2"] = load_probe_reference(probe_json, seed)
+        if sres["probe_r2"] is None and probe_r2 is not None:
+            sres["probe_r2"] = float(probe_r2)
+        for n in feats:
+            sres["states"][n] = {}
+            for mult in noise_mults:
+                sres["states"][n][str(mult)] = {}
+                for v in VARIANTS:
+                    sres["states"][n][str(mult)][v] = {}
+                    for r in readouts:
+                        Ea = E[(n, str(mult), v, r)]
+                        ci = bootstrap_r2(Ea, Y, n_boot=n_boot, seed=seed)
+                        d = (bootstrap_r2(Ea, Y, E[("NULL", str(mult), v, r)], n_boot, seed, level) if n != "NULL"
+                             else {"point": 0.0, "lo": 0.0, "hi": 0.0})
+                        sres["states"][n][str(mult)][v][r] = {
+                            "r2": ci["point"], "r2_lo": ci["lo"], "r2_hi": ci["hi"],
+                            "diff_vs_null": {"diff": d["point"], "lo": d["lo"], "hi": d["hi"]},
+                            "per_output": [float(x) for x in r2_per_output(Ea, Y)]}
+        raw, _ = build_rand_raw(cfg)
+        maps = build_written_maps(cfg)
+        P = position_targets(cfg)
+        sres["baselines"]["fft_concat"] = {"shape": {r: {"r2": bootstrap_r2(squared_errors(BASELINE_SETS["fft_concat"](raw), Y, make_regressor(r), k, repeats, seed), Y, n_boot=n_boot, seed=seed)["point"]} for r in readouts}}
+        sres["baselines"]["map"] = {"position": {r: {"r2": bootstrap_r2(squared_errors(maps, P, make_regressor(r), k, repeats, seed), P, n_boot=n_boot, seed=seed)["point"]} for r in readouts}}
+        sres["verdict"] = verdict(sres)
+        sres["verdict_at"] = {str(m): verdict(sres, str(m))["outcome"] for m in noise_mults if m > 0}
+        if statedecode_json and Path(statedecode_json).exists():
+            ref = json.loads(Path(statedecode_json).read_text())["seeds"][str(seed)]["states"]
+            pairs = {"mod_H": "H", "mod_s": "s_full", "u_full": "u_full", "u_ring": "u_ring"}
+            sres["reproduction"] = {a: max(abs(sres["states"][a]["0.0"]["pool4"][r]["r2"] - ref[b]["pool4"]["shape"][r]["r2"])
+                                           for r in readouts) for a, b in pairs.items() if "0.0" in sres["states"][a]}
+        res["seeds"][seed] = sres
+        if verbose:
+            print(f"[seed {seed}] {sres['verdict']['outcome']}: {sres['verdict']['text']}", flush=True)
+    res["combined"] = combine_verdicts({s: r["verdict"] for s, r in res["seeds"].items()})
+    res["seconds"] = time.time() - t0
+    return res
+
+
+def format_report(res: dict) -> str:
+    c = res["config"]
+    rd = c["readouts"]
+    lines = [f"WaveBrain modulation-map decoding (trials={c['n_trials']}, seeds={c['seeds']}, readout noise = multiple of "
+             f"the sensor noise {c['base_noise']}, same realisation for every state; band {c['band']})"]
+    for seed, s in res["seeds"].items():
+        lines += ["", f"=== seed {seed}: shape R2 [95% CI] ===",
+                  f"{'state / noise':<20}" + "".join(f"{v + '/' + r:>24}" for v in VARIANTS for r in rd),
+                  "-" * (20 + 24 * len(VARIANTS) * len(rd))]
+        for n, d in s["states"].items():
+            for m in d:
+                row = f"{n + ' x' + m:<20}"
+                for v in VARIANTS:
+                    for r in rd:
+                        x = d[m][v][r]
+                        row += f"{x['r2']:+.2f} [{x['r2_lo']:+.2f},{x['r2_hi']:+.2f}]".rjust(24)
+                lines.append(row)
+        lines += ["", f"controls: Fourier features shape R2 {s['baselines']['fft_concat']['shape']['linear']['r2']:+.3f}; "
+                      f"pooled written map placement R2 {max(v['r2'] for v in s['baselines']['map']['position'].values()):+.2f}"]
+        if s.get("probe_r2") is not None:
+            lines.append(f"probe readout (v10) shape R2 of the same trials, FULL arm, base noise: {s['probe_r2']:+.2f}")
+        if "reproduction" in s:
+            lines.append("reproduction of v11 (noise-free; max |delta R2|, R2 is scale-invariant): "
+                         + "  ".join(f"{a} {d:.1e}" for a, d in s["reproduction"].items()))
+        v = s["verdict"]
+        lines += ["", f"VERDICT (seed {seed}, noise x{PRIMARY_MULT}): {v['outcome']}"
+                  + (f"  [{v['channel']}, {v['fast']}]" if "channel" in v else ""), f"  {v['text']}", f"  Next: {v['next']}",
+                  f"  outcome at other noise levels: {s['verdict_at']}"]
+    lines += ["", f"COMBINED: {res['combined']['outcome']}  (per seed: {res['combined']['per_seed']})"]
+    return "\n".join(lines)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--trials", type=int, default=240)
+    ap.add_argument("--seeds", default="0,1")
+    ap.add_argument("--cache", default=None, help="directory of cached state arrays (from statedecode)")
+    ap.add_argument("--probe-json", default=None, help="decode_results.json of the v10 diagnostic")
+    ap.add_argument("--probe-r2", type=float, default=None, help="probe reference if no json is given")
+    ap.add_argument("--statedecode-json", default=None, help="v11 statedecode_results.json for the reproduction check")
+    ap.add_argument("--boot", type=int, default=2000)
+    ap.add_argument("--json", default=None)
+    a = ap.parse_args(argv)
+    res = run_modmap(a.trials, tuple(int(x) for x in a.seeds.split(",")), cache_dir=a.cache, probe_json=a.probe_json,
+                     probe_r2=a.probe_r2, statedecode_json=a.statedecode_json, n_boot=a.boot)
+    print("\n" + format_report(res) + f"\n\n(total {res['seconds']:.0f}s)")
+    if a.json:
+        def stringify(o):
+            return {str(k): stringify(v) for k, v in o.items()} if isinstance(o, dict) else o
+        with open(a.json, "w") as fh:
+            json.dump(strip_private(stringify(res)), fh, indent=2)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+python3 -c "import wavebrain.modmap as m; print('import ok')"
+
+
+Response:
+
+{"returncode":0,"stdout":"19\n4\n2\nimport ok\n","stderr":""}
