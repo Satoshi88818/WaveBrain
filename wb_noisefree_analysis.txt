@@ -1,0 +1,19 @@
+cd /home/squire/wavebrain_project; md5sum -c /tmp/code_at_retention_final.txt | grep -vc OK
+python3 -m wavebrain.retention --trials 240 --seeds 0,1 --cache /home/squire/cache_ret_final --boot 2000 --json retention_results.json > retention_output.txt 2>&1; tail -2 retention_output.txt | cut -c1-80
+python3 -m wavebrain.retention --trials 240 --seeds 0,1 --mults 0.0 --cache /home/squire/cache_ret_final --boot 2000 --json retention_noisefree_results.json > retention_noisefree_output.txt 2>&1; tail -2 retention_noisefree_output.txt | cut -c1-80
+python3 - << 'EOF'
+import json
+M=json.load(open('retention_results.json')); NF=json.load(open('retention_noisefree_results.json'))
+S=("0","1"); DEL=("0","250","500","1000","2000")
+r=lambda D,l,m: {s:[round(D["seeds"][s]["cells"][l][d][m]["rbf"]["r2"],2) for d in DEL] for s in S}
+print("SLOW  x1   :", r(M,"SLOW","1.0")); print("HOLO  x1   :", r(M,"HOLO","1.0")); print("HOLO  x4   :", r(M,"HOLO","4.0"))
+print("HOLO noise-free:", r(NF,"HOLO","0.0")); print("SLOW noise-free:", r(NF,"SLOW","0.0"))
+for D,m,nm in ((M,"1.0","x1"),(M,"4.0","x4"),(NF,"0.0","noise-free")):
+    print(f"HOLO-SLOW @2000 {nm}:", {s: (round(D['seeds'][s]['hs']['2000'][m]['rbf']['point'],2), round(D['seeds'][s]['hs']['2000'][m]['rbf']['lo'],2), round(D['seeds'][s]['hs']['2000'][m]['rbf']['hi'],2)) for s in S})
+print("verdicts:", {s: M["seeds"][s]["verdict"]["outcome"] for s in S}, "| at x4:", {s: M["seeds"][s]["verdict_at"]["4.0"] for s in S}, "| half-lives:", {s: M["seeds"][s]["verdict"]["half_lives"] for s in S})
+print("controls: fft", [round(M["seeds"][s]["baselines"]["fft_concat"]["shape"]["linear"]["r2"],3) for s in S], "map", [round(M["seeds"][s]["baselines"]["map"]["position"]["rbf"]["r2"],2) for s in S])
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"0\n\n(total 49s)\n\n(total 28s)\nSLOW  x1   : {'0': [0.52, 0.5, 0.45, 0.31, 0.15], '1': [0.51, 0.47, 0.43, 0.3, 0.15]}\nHOLO  x1   : {'0': [0.19, 0.17, 0.16, 0.12, 0.08], '1': [0.16, 0.15, 0.12, 0.09, 0.05]}\nHOLO  x4   : {'0': [0.04, 0.03, 0.02, 0.01, -0.01], '1': [0.01, 0.01, -0.0, -0.01, -0.01]}\nHOLO noise-free: {'0': [0.34, 0.34, 0.34, 0.34, 0.34], '1': [0.36, 0.36, 0.36, 0.36, 0.36]}\nSLOW noise-free: {'0': [0.52, 0.51, 0.52, 0.5, 0.42], '1': [0.51, 0.48, 0.5, 0.47, 0.37]}\nHOLO-SLOW @2000 x1: {'0': (-0.07, -0.1, -0.05), '1': (-0.1, -0.12, -0.08)}\nHOLO-SLOW @2000 x4: {'0': (-0.13, -0.15, -0.11), '1': (-0.13, -0.15, -0.11)}\nHOLO-SLOW @2000 noise-free: {'0': (-0.08, -0.14, -0.02), '1': (-0.01, -0.08, 0.07)}\nverdicts: {'0': 'SLOW_PERSISTS', '1': 'SLOW_PERSISTS'} | at x4: {'0': 'HOLO_NEVER_ABOVE_FLOOR', '1': 'HOLO_NEVER_ABOVE_FLOOR'} | half-lives: {'0': {'HOLO': 1622.5847845524763, 'HOLO_SLOW': 1147.4707962828502, 'SLOW': 1300.2601419708583}, '1': {'HOLO': 1284.7979230547198, 'HOLO_SLOW': 1108.8669627606362, 'SLOW': 1281.1637094317905}}\ncontrols: fft [1.0, 1.0] map [0.43, 0.44]\n","stderr":""}
