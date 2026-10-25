@@ -1,0 +1,5 @@
+cd /home/squire/wavebrain_project; ps -o pid,etime,cmd -C python3 | cut -c1-90; echo "--- log tail:"; tail -c 300 /tmp/full_tests7.txt; echo; ls -la --time-style=+%H:%M:%S /tmp/full_tests7.txt coverage_report.txt | cut -c1-120; date +%H:%M:%S
+
+Response:
+
+{"returncode":0,"stdout":"  PID     ELAPSED CMD\n--- log tail:\n........................................................................ [ 29%]\n........................................................................ [ 59%]\n........................................................................ [ 88%]\n.......\n-rw-r--r-- 1 root root  247 03:13:27 /tmp/full_tests7.txt\n-rw-r--r-- 1 root root 1128 10:08:59 coverage_report.txt\n08:19:51\n","stderr":""}
