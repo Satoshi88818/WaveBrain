@@ -1,0 +1,24 @@
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+import subprocess, sys, re
+import mutation_check as m
+groups = {"v6": m.MUTATIONS, "pilot": m.PILOT_MUTATIONS, "readout": m.READOUT_MUTATIONS, "rand": m.RAND_MUTATIONS,
+          "decode": m.DECODE_MUTATIONS, "noise": m.NOISE_MUTATIONS, "state": m.STATE_MUTATIONS,
+          "modmap": m.MODMAP_MUTATIONS, "retention": m.RETENTION_MUTATIONS}
+bad, total = [], 0
+for g, entries in groups.items():
+    for name, rel, old, new, tests, *rest in entries:
+        total += 1
+        cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q", *tests.split()]
+        if rest and rest[0]:
+            cmd += ["-k", rest[0]]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        n = sum(int(x) for x in re.findall(r": (\d+)\s*$", r.stdout, re.M)) or len(re.findall(r"::", r.stdout))
+        if r.returncode != 0 or n == 0:
+            bad.append((g, name, rest[0] if rest else None, r.returncode, n))
+print(f"audited {total} mutation entries across {len(groups)} groups")
+print("entries whose test selection is EMPTY (would be falsely 'caught'):", bad if bad else "none")
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"audited 110 mutation entries across 9 groups\nentries whose test selection is EMPTY (would be falsely 'caught'): none\n","stderr":""}
