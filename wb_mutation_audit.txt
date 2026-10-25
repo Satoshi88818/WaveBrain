@@ -1,0 +1,30 @@
+cd /home/squire/wavebrain_project; sleep 5; tail -3 coverage_report.txt
+python3 mutation_check.py --audit > mutation_audit.txt 2>&1; cat mutation_audit.txt
+python3 mutation_check.py --group retention > mutation_output_retention.txt 2>&1; cat mutation_output_retention.txt | tail -17
+tail -2 /tmp/full_tests9.txt > pytest_final.txt; cat pytest_final.txt | tail -1; md5sum -c /tmp/code_at_retention_final.txt | grep -vc OK
+
+Response:
+
+wavebrain/study.py           265      7    97%
+----------------------------------------------
+TOTAL                       2659     54    98%
+audited 110 mutation entries across 9 groups
+entries with an EMPTY test selection: none
+== retention defects ==
+CAUGHT  fast-field lesion zeroes only one time level
+CAUGHT  'fast' lesion also zeroes the slow field
+CAUGHT  'both' lesion leaves the slow field
+CAUGHT  SLOW lesion written with the hologram on
+CAUGHT  delay stepping runs the cumulative delay each time
+CAUGHT  modulation coefficients swapped
+CAUGHT  cache key ignores the delays
+CAUGHT  half-life not interpolated
+CAUGHT  interval ignored when counting an R-squared
+CAUGHT  NULL leak rule disabled
+CAUGHT  hologram-beats-slow test uses the wrong side of the interval
+CAUGHT  extension needs no minimum R-squared
+CAUGHT  hologram floor rule disabled
+CAUGHT  comparison family level dropped
+14/14 injected defects detected
+244 passed in 276.64s (0:04:36)
+0
