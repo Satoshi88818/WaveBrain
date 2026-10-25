@@ -1,0 +1,263 @@
+cd /home/squire/wavebrain_project; python3 - << 'EOF'
+t='tests/test_retention.py'; s=open(t).read()
+old='''    assert set(s["verdict_at"]) == {"0.0"} and s["verdict"]["outcome"] in {
+        "HOLO_NEVER_ABOVE_FLOOR", "PLASTICITY_EXTENDS_MEMORY", "SLOW_PERSISTS", "BOTH_FADE"}   # primary falls back to 0.0'''
+new='''    assert set(s["verdict_at"]) == {"0.0"} and s["verdict"]["outcome"] in {                      # primary falls back to 0.0
+        "HOLO_NEVER_ABOVE_FLOOR", "PLASTICITY_EXTENDS_MEMORY", "SLOW_PERSISTS", "BOTH_FADE",
+        "STATE_CONTROL_FAILS", "POSITIVE_CONTROL_FAILS", "CONTROL_FAILS"}                       # 24 trials may fail a control'''
+assert old in s; open(t,'w').write(s.replace(old,new))
+EOF
+python3 -m pytest tests/test_retention.py 2>&1 | tail -2; md5sum -c /tmp/code_at_retention_final2.txt | grep -vc OK
+find . -name __pycache__ -prune -exec rm -rf {} + ; rm -rf .pytest_cache .coverage
+setsid nohup sh -c "python3 -m coverage run --source=wavebrain -m pytest > /tmp/full_tests7.txt 2>&1; python3 -m coverage report > coverage_report.txt 2>&1; python3 mutation_check.py --group retention > mutation_output_retention.txt 2>&1" < /dev/null > /dev/null 2>&1 &
+cat > /home/squire/build_md8.py << 'PYEOF'
+import json, re, subprocess, sys
+import numpy as np
+from pathlib import Path
+
+R = Path("/home/squire/wavebrain_project")
+read = lambda p: (R / p).read_text().rstrip("\n")
+M = json.loads(read("retention_results.json")); NF = json.loads(read("retention_noisefree_results.json"))
+out = read("retention_output.txt"); table = out[out.index("WaveBrain retention"):]
+nfo = read("retention_noisefree_output.txt"); nftable = nfo[nfo.index("WaveBrain retention"):]
+cov = read("coverage_report.txt"); test_run = read("pytest_final.txt"); mut = read("mutation_output_retention.txt")
+collect = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q"], cwd=R, capture_output=True, text=True).stdout
+counts = {}
+for line in collect.splitlines():
+    m = re.match(r"tests/(\w+)\.py: (\d+)", line)
+    if m: counts[m.group(1)] = int(m.group(2)); continue
+    m = re.match(r"tests/(\w+)\.py::", line)
+    if m: counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+total = sum(counts.values()); assert total > 235, counts
+n_new = counts.get("test_retention", 0)
+
+def rng(v, d=2):
+    lo, hi = min(v), max(v)
+    return f"{lo:+.{d}f}" if f"{lo:+.{d}f}" == f"{hi:+.{d}f}" else f"{lo:+.{d}f} to {hi:+.{d}f}"
+def rng0(v, d=2):
+    lo, hi = min(v), max(v)
+    return f"{lo:.{d}f}" if f"{lo:.{d}f}" == f"{hi:.{d}f}" else f"{lo:.{d}f} to {hi:.{d}f}"
+S = ("0", "1"); DEL = ("0", "250", "500", "1000", "2000")
+cell = lambda D, s, l, d, m, r="rbf": D["seeds"][s]["cells"][l][d][m][r]
+r2 = lambda D, l, d, m, r="rbf": [cell(D, s, l, d, m, r)["r2"] for s in S]
+traj = lambda D, l, m, r="rbf": " / ".join(rng0(r2(D, l, d, m, r)) for d in DEL)
+hs = lambda D, m, r="rbf": [D["seeds"][s]["hs"]["2000"][m][r] for s in S]
+hl = {s: M["seeds"][s]["verdict"]["half_lives"] for s in S}
+fmt_hl = lambda name: " and ".join((f"{v:.0f}" if isinstance(v, float) else str(v)) for v in (hl[s][name] for s in S))
+vd = {s: M["seeds"][s]["verdict"] for s in S}; va = {s: M["seeds"][s]["verdict_at"] for s in S}
+decay = 0.9995; half_h = -np.log(2) / np.log(decay); fac2000 = decay ** 2000
+mut_total = sum(int(x) for x in re.findall(r"(\d+)/\d+ injected", mut)); mut_of = sum(int(x) for x in re.findall(r"\d+/(\d+) injected", mut))
+
+v6 = ["wavebrain/__init__.py", "wavebrain/config.py", "wavebrain/sources.py", "wavebrain/sensors.py", "wavebrain/medium.py",
+      "wavebrain/classifier.py", "wavebrain/experiment.py", "wavebrain/benchmark.py"]
+v7 = ["wavebrain/stats.py", "wavebrain/pairtask.py", "wavebrain/pilot.py"]
+v8 = ["wavebrain/readouts.py", "wavebrain/study.py", "wavebrain/baselines.py"]
+v9 = ["wavebrain/randshapes.py", "wavebrain/randstudy.py"]
+v10 = ["wavebrain/decode.py", "wavebrain/noisecheck.py"]
+v11 = ["wavebrain/statedecode.py", "wavebrain/modmap.py"]
+new_files = ["wavebrain/retention.py"]; new_tests = ["tests/test_retention.py"]
+old_tests = ["tests/test_config.py", "tests/test_medium.py", "tests/test_sensors.py", "tests/test_classifier.py", "tests/test_experiment.py",
+             "tests/test_pilot.py", "tests/test_readouts.py", "tests/test_study.py", "tests/test_baselines.py", "tests/test_randshapes.py",
+             "tests/test_randstudy.py", "tests/test_decode.py", "tests/test_noisecheck.py", "tests/test_statedecode.py", "tests/test_modmap.py"]
+
+md = f"""# WaveBrain v13: does plasticity extend memory? (validated)
+
+This document implements the retention experiment recommended after v12: follow the stored state over delays of 0 to 2000 steps with the slow field, the fast field and the hologram separated by lesion, and decode shapes from the modulation map `0.3 s + 0.5 H` under readout noise. It needs **new simulation** (about 13 minutes for both seeds) and extends the package without modifying any v6 to v12 module apart from the additions described in section 3 (checked by hash). Everything below (source, test output, results) comes from running the code in this document. Only `numpy` is required at runtime; `pytest` is needed for the tests.
+
+Scope: this is a **state-level** analysis. No probe is run; probe-level retention is not done (section 9).
+
+## 1. Result in one paragraph
+
+**The prediction I fixed in advance is refuted at realistic readout noise: the slow field, not the hologram, is the longer and stronger memory over 0 to 2000 steps.** With readout noise equal to the sensor noise, the shape R-squared of the slow field alone goes {traj(M,'SLOW','1.0')} at delays 0, 250, 500, 1000 and 2000 (RBF readout, seeds 0 and 1), while the hologram's part goes {traj(M,'HOLO','1.0')}. At delay 2000 the hologram is below the slow field (paired difference {rng(hs(M,'1.0') and [h['point'] for h in hs(M,'1.0')],3)}; both intervals entirely below 0). At four times the noise the hologram's part never rises above the noise floor (outcome HOLO_NEVER_ABOVE_FLOOR in both seeds); adding the hologram to the slow field changes nothing (HOLO_SLOW is about equal to SLOW).
+
+**A noise-free analysis tells a more nuanced story.** The hologram's information does not decay at all (R-squared {rng0(r2(NF,'HOLO','0','0.0'))} at every delay), as it must, since H only shrinks by a constant factor and R-squared ignores scale. The slow field is nearly flat to 1000 steps and then starts to fall ({traj(NF,'SLOW','0.0')}), so by delay 2000 the two are close (HOLO minus SLOW {rng(hs(NF,'0.0') and [h['point'] for h in hs(NF,'0.0')],3)}; the interval for seed 1 includes 0). **In information terms the hologram persists; in terms of what survives realistic noise, it does not.** The reason is its amplitude: with `holo_decay = 0.9995` its half-life is only {half_h:.0f} steps, so over 2000 steps it falls to {100*fac2000:.0f}% of its starting amplitude and sinks toward the noise.
+
+---
+
+## 2. What this changes in the story
+
+* v12: the part of the state the probe can reach is mostly the slow field, and the hologram's part is small. v13: that picture holds over the whole 0 to 2000 range at realistic noise, and the slow field is long-lived: its half-life under noise is about {fmt_hl('SLOW')} steps (seeds 0 and 1), not the few hundred steps its damping constant suggests.
+* The plastic hologram does **not** extend memory beyond the field in this design at the sensor noise level. Whether it would with a lower noise floor or a longer decay time is not tested here, but its information is intact in the noise-free analysis, which says the limit is its **amplitude and decay constant**, not the write rule's ability to store shape.
+* The experiment covers only about {2000/half_h:.1f} hologram half-lives, so it cannot say what happens in the regime where a long-term memory would matter.
+
+---
+
+## 3. Design, corrections and honest caveats
+
+### Lesions (applied at the end of the write phase; the fast field is always zeroed)
+
+| lesion | hologram | fast field | slow field | state left |
+|---|---|---|---|---|
+| HOLO | on | zeroed | zeroed | H only |
+| HOLO_SLOW | on | zeroed | kept | H and s |
+| SLOW | off | zeroed | kept | s only |
+| NULL | zeros | | | negative control (noise only; no simulation needed) |
+
+The fast field is zeroed in every lesion because its linear effect on the probe is removed by the paired baseline subtraction, and because v9 to v11 never separated it from the slow field. Each lesion is followed through delays 0, 250, 500, 1000 and 2000 steps after the write; at each the pooled H and s are captured (361 values over the interior) and the modulation map `0.3 s + 0.5 H` is decoded with the v10 shape targets and regressors, with readout noise at 1 and 4 times the sensor noise (the same realisation for every lesion). Controls: Fourier features (positive), noise-only NULL, and the pooled written map.
+
+### Decision rule (fixed before the reported run)
+
+With h(t) and s(t) the best R-squared of HOLO and SLOW at delay t (counted only if the interval versus NULL is above 0) and T the longest delay: **HOLO_NEVER_ABOVE_FLOOR** if h(t) is below 0.10 at every delay; **PLASTICITY_EXTENDS_MEMORY** if h(T) is at least 0.10 and HOLO beats SLOW at T (paired interval above 0); **SLOW_PERSISTS** otherwise if s(T) is at least 0.10; **BOTH_FADE** otherwise. The usual controls come first. Half-lives are reported descriptively.
+
+### What was tuned, and on which data
+
+* The tuning pass used **seed 1000** with 60 trials. It exercised the plumbing and showed the same qualitative picture (slow field decays slowly, hologram at the floor). At 60 trials the written-map control read 0.24, just under its 0.25 gate (calibrated at 120 trials), so the tuning verdict was STATE_CONTROL_FAILS; at 240 trials the map reaches 0.43 to 0.44. That is a sample-size effect, and the threshold was not changed.
+* Seeds **0 and 1** were run once for the reported results. **After that run I added a `--mults` option** (so the noise-free variant could be run) and made the primary-level choice fall back to the first multiplier when 1.0 is absent. I then **re-ran the reported analysis from the cached arrays with the final code and verified that the results are identical** (excluding runtime). The noise-free analysis is **exploratory and post hoc**: it was prompted by the reported result.
+
+### Caveats
+
+1. **The conclusion depends on the noise model.** At the sensor noise level the hologram's part is weak and decays toward the floor; noise-free it does not decay. The noise model is a calibration (v12), not the real probe path.
+2. **The hologram's constant noise-free R-squared is true by construction**: after the write, H only decays by the factor `holo_decay` per step, and R-squared is scale-invariant. It shows the pattern is not lost, not that it is readable.
+3. **Why the slow field lasts.** Its damping constant suggests a decay of a few hundred steps, but its low-wavenumber components decay slowly (an overdamped mode); I measured the behaviour, not the mechanism.
+4. **Linear readouts fail under noise** (R-squared below zero, also on the noise-only NULL); the verdict uses the best readout, so it is unaffected.
+5. **Only the slow-versus-hologram comparison is tested.** The fast field, the probe path and the effect of the noise-equivalence assumption are not examined here.
+
+---
+
+## 4. Results (seeds 0 and 1, 240 trials each)
+
+### With readout noise (the pre-registered analysis)
+
+```text
+{table}
+```
+
+### Without readout noise (exploratory, post hoc)
+
+```text
+{nftable}
+```
+
+### Reading the tables
+
+* **Slow field (SLOW), RBF, noise x1:** {traj(M,'SLOW','1.0')} at delays 0, 250, 500, 1000, 2000. At x4: {traj(M,'SLOW','4.0')}. Half-life under noise (x1): {fmt_hl('SLOW')} steps.
+* **Hologram part (HOLO), RBF, noise x1:** {traj(M,'HOLO','1.0')}. At x4: {traj(M,'HOLO','4.0')}, i.e. at the floor from the start. Half-life (x1): {fmt_hl('HOLO')} steps.
+* **Both together (HOLO_SLOW), x1:** {traj(M,'HOLO_SLOW','1.0')}; the hologram adds nothing to the slow field.
+* **Delay 2000, HOLO minus SLOW (RBF):** x1 {rng([h['point'] for h in hs(M,'1.0')],3)}, x4 {rng([h['point'] for h in hs(M,'4.0')],3)}, noise-free {rng([h['point'] for h in hs(NF,'0.0')],3)}.
+* **Noise-free:** HOLO {traj(NF,'HOLO','0.0')} (constant); SLOW {traj(NF,'SLOW','0.0')}; HOLO_SLOW {traj(NF,'HOLO_SLOW','0.0')}.
+* **Controls:** Fourier features 1.000; pooled written map placement {rng0([M['seeds'][s]['baselines']['map']['position']['rbf']['r2'] for s in S])}; NULL (noise only) {rng([M['seeds'][s]['null']['1.0']['rbf']['r2'] for s in S])}.
+* **Verdicts:** seed 0 {vd['0']['outcome']}, seed 1 {vd['1']['outcome']} at x1; at x4: {va['0']['4.0']} and {va['1']['4.0']}.
+
+---
+
+## 5. What this does and does not show
+
+**Shown:** over 0 to 2000 steps, at realistic readout noise, the slow field carries more decodable shape information than the hologram at every delay, and it is long-lived; the hologram adds nothing to it; in a noise-free reading the hologram keeps its information indefinitely (by construction) while the slow field begins to decline after about 1000 steps.
+
+**Not shown:** what happens at delays beyond 2000 steps (about {2000/half_h:.1f} hologram half-lives); whether a longer hologram decay time or a lower noise floor would let the hologram take over; whether the probe can read what the state holds at these delays (no probe was run); how the fast field behaves.
+
+---
+
+## 6. Problems found while building this
+
+| # | Problem | How it surfaced | Fix | Guard |
+|---|---|---|---|---|
+| 1 | The conclusion hinged on the readout noise, and the noise-free case could not be run | reading the reported result | `--mults` option; primary level falls back when 1.0 is absent; reported run re-run from cache and verified identical | `test_noise_free_run_and_the_mults_option` |
+| 2 | My noise-free test asserted a verdict set that excluded the control failures a 24-trial run legitimately returns | first test run | test corrected | the test itself |
+| 3 | The written-map control is sample-size dependent (0.24 at 60 trials, 0.43 at 240) | tuning pass | documented; threshold unchanged | not code |
+| 4 | The retention window is short relative to the hologram's own half-life | arithmetic on `holo_decay` | stated in sections 2 and 5 | not code |
+
+---
+
+## 7. Validation evidence
+
+**Test suite**: {total} tests, all passing ({n_new} new here; the earlier {total - n_new} unchanged).
+
+```text
+{test_run}
+```
+
+| file | tests | covers |
+|---|---|---|
+| earlier test files | {total - n_new} | v6 to v12 (unchanged) |
+| `test_retention.py` | {n_new} | each lesion zeroes exactly what it says (all time levels), the hologram state decays exactly by `holo_decay` per step and is independent of the fields, each lesion leaves only its own state, incremental delay stepping equals a single run, agreement with the v11 state capture at 250 steps, cache safety and key sensitivity to the delays, modulation coefficients, half-life interpolation, every verdict branch and boundary, interval requirement, verdict at another noise level, noise-free runs and the `--mults` option, family-wise levels, end-to-end runner, report and CLI |
+
+**Coverage**
+
+```text
+{cov}
+```
+
+**Mutation check for the new code**: each defect is injected into a temporary copy and the relevant tests must fail. {mut_total} of {mut_of} were caught on the first run.
+
+```text
+{mut}
+```
+
+The 96 mutations of v6 to v12 were checked in the earlier rounds (all caught); those modules are byte-identical now.
+
+**Other checks**: the reported analysis re-run with the final code reproduces the first run exactly; the hologram state at 250 steps equals the v11 state capture; the NULL arm (noise only) scores at or below zero.
+
+---
+
+## 8. Limitations
+
+* **One medium, one configuration, two seeds** of 240 trials; the seeds agree.
+* **State level only**: no probe was run, so nothing here says what the probe can read at long delays.
+* **Delays up to 2000 steps** (about {2000/half_h:.1f} hologram half-lives).
+* **The noise model is a calibration**, and the conclusion depends on it (section 3).
+* **The hologram's design constants** (`holo_decay` 0.9995, `holo_rate`, `holo_mod`) were not varied.
+* **The noise-free analysis is exploratory and post hoc.**
+
+---
+
+## 9. Recommended next step
+
+The hologram's information is intact but its amplitude is too low and its half-life too short to survive the noise; the slow field wins in the range tested. Three cheap-to-moderate steps follow:
+
+1. **Extend the delay analytically.** H evolves only by decay after the write, so its state at any delay is exact without simulation; only the slow field needs simulating. Run the SLOW lesion alone to about 10000 steps (about 15 to 20 minutes) and compute where, in noise-free and noisy terms, the hologram's readable information overtakes the slow field's.
+2. **Vary the hologram's design constants** (`holo_decay` 0.9999 or 0.99995, a larger `holo_rate`) in a state-level run, to see whether a hologram with a longer half-life and larger amplitude beats the slow field at realistic noise.
+3. **Only then run probe-level retention** (probe at each delay for the three lesions, about 20 minutes extra), to see whether the probe can read the hologram when it is strong enough.
+
+---
+
+## 10. Quick start
+
+```bash
+pip install numpy pytest                  # coverage is optional
+python -m pytest                          # about 5 min, {total} tests
+python -m wavebrain.retention --seeds 0,1 --cache cache_ret --json retention_results.json            # about 13 min the first time (simulates), about 2 min afterwards
+python -m wavebrain.retention --seeds 0,1 --mults 0.0 --cache cache_ret --json retention_noisefree_results.json   # exploratory, no readout noise
+python mutation_check.py --group retention
+```
+
+Use another seed (for example 1000) when experimenting so seeds 0 and 1 stay untouched.
+
+## 11. Project layout
+
+```text
+wavebrain_project/
+  pytest.ini  mutation_check.py (extended)  seed_check.py
+  wavebrain/
+    config.py sources.py sensors.py medium.py classifier.py experiment.py benchmark.py   (v6, unchanged)
+    stats.py pairtask.py pilot.py                                                          (v7, unchanged)
+    readouts.py study.py baselines.py                                                      (v8, unchanged)
+    randshapes.py randstudy.py                                                             (v9, unchanged)
+    decode.py noisecheck.py                                                                (v10, unchanged)
+    statedecode.py modmap.py                                                               (v11, v12, unchanged)
+    retention.py    NEW  lesions, delay snapshots, cache, half-lives, verdict, runner
+  tests/            {total} tests; new: test_retention.py
+```
+
+---
+
+## 12. Source code
+
+### 12.1 New module
+
+"""
+def block(f):
+    lang = "ini" if f.endswith(".ini") else "python"
+    return f"#### `{f}`\n\n```{lang}\n{read(f)}\n```\n\n"
+for f in new_files: md += block(f)
+md += "### 12.2 New test and the extended mutation script\n\n"
+for f in new_tests + ["mutation_check.py"]: md += block(f)
+md += "### 12.3 Unchanged v6 to v12 modules (included so this document is self-contained)\n\n"
+for f in v6 + v7 + v8 + v9 + v10 + v11: md += block(f)
+md += "### 12.4 Unchanged earlier tests and scripts\n\n"
+for f in old_tests + ["seed_check.py", "pytest.ini"]: md += block(f)
+Path("/mnt/user-data/outputs").mkdir(parents=True, exist_ok=True)
+Path("/mnt/user-data/outputs/WaveBrain_v13_retention.md").write_text(md)
+print("written", len(md), "chars,", md.count("\n"), "lines; tests:", total, counts)
+PYEOF
+sleep 120; tail -2 /tmp/full_tests7.txt
