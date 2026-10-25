@@ -1,0 +1,328 @@
+cd /home/squire/wavebrain_project; cat > wavebrain/retention.py << 'EOF'
+"""Does plasticity extend memory?   ``python -m wavebrain.retention``
+
+v12 found that the part of the stored state a probe can couple to, ``slow_mod * s + holo_mod * H``, is carried almost entirely by the SLOW field at a delay of 250 steps, and that the hologram's part is small
+and fragile under noise.  The hologram is the only memory designed to persist, so the question is what
+happens over longer delays.  Prediction fixed before the reported run: the slow field fades and the
+hologram's part persists, so the hologram overtakes it at long delays.
+
+Lesions applied at the end of the write phase (the fast field is always zeroed: its linear effect on the
+probe is removed by the paired baseline subtraction, and v9 to v11 never separated it from the slow field)
+    HOLO       hologram on,  fast and slow fields zeroed   -> H only
+    HOLO_SLOW  hologram on,  fast field zeroed             -> H and s
+    SLOW       hologram off, fast field zeroed             -> s only
+    NULL       all zero (no simulation needed)             -> negative control (noise only)
+
+Each lesion is followed for several delays; at each, the pooled modulation map ``slow_mod * s + holo_mod * H``
+is decoded (shape descriptors, v10 targets) with readout noise added as in v12.  STATE level only: no probe
+is run.
+
+Pre-registered decision rule: see ``verdict``.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+
+from .decode import (DECODE_READOUTS, bootstrap_r2, make_regressor, position_targets, r2_per_output, shape_basis,
+                     shape_targets, squared_errors)
+from .modmap import MIN_R2, add_noise
+from .pilot import strip_private
+from .randshapes import build_rand_raw, rand_write_phase
+from .randstudy import BASELINE_SETS, rand_arm_config
+from .statedecode import POSITIVE_CONTROL_R2, STATE_CONTROL_MIN, build_written_maps, interior_pool
+from .study import clear_fields, combine_verdicts
+
+DELAYS = (0, 250, 500, 1000, 2000)
+MULTS = (1.0, 4.0)
+PRIMARY_MULT = "1.0"
+LESIONS = {"HOLO": ("FULL", "both"), "HOLO_SLOW": ("FULL", "fast"), "SLOW": ("RING_ONLY", "fast")}
+DECODED = ("HOLO", "HOLO_SLOW", "SLOW")
+
+
+# ------------------------------------------------------------------- lesions
+def zero_fast_field(sim) -> None:
+    """Zero the fast field at all time levels; keep the slow field, the hologram and the clock."""
+    sim._f[...] = 0.0
+
+
+def apply_lesion(sim, what: str) -> None:
+    if what == "both":
+        clear_fields(sim)
+    elif what == "fast":
+        zero_fast_field(sim)
+    else:
+        raise ValueError(f"unknown lesion '{what}'")
+
+
+# ----------------------------------------------------------------- snapshots
+def trial_snapshots(cfg_full, cfg_ring, index: int, delays=DELAYS) -> tuple[dict, float]:
+    """Write the trial once with the hologram on and once with it off, apply each lesion, follow it
+    through ``delays`` (steps after the write) and snapshot the pooled H and s at each."""
+    sp = cfg_full.base.medium.sponge_width
+    written = {"FULL": rand_write_phase(cfg_full, index)[0], "RING_ONLY": rand_write_phase(cfg_ring, index)[0]}
+    out, clips = {}, 0.0
+    for name, (arm, what) in LESIONS.items():
+        sim = written[arm].clone()
+        apply_lesion(sim, what)
+        t, H, s = 0, [], []
+        for d in delays:
+            sim.run(d - t)
+            t = d
+            H.append(interior_pool(sim.H, sp)); s.append(interior_pool(sim.s, sp))
+        out[name] = {"H": np.stack(H), "s": np.stack(s)}
+        clips = max(clips, float(sim.clip_events))
+    return out, clips
+
+
+def build_retention_arrays(cfg_full, cfg_ring, delays=DELAYS, verbose: bool = False) -> dict:
+    per, clips = [], 0.0
+    t0 = time.time()
+    for i in range(cfg_full.n_trials):
+        snap, c = trial_snapshots(cfg_full, cfg_ring, i, delays)
+        per.append(snap); clips = max(clips, c)
+        if verbose and (i + 1) % 40 == 0:
+            print(f"    trial {i + 1}/{cfg_full.n_trials} ({time.time() - t0:.0f}s)", flush=True)
+    arrays = {"clip_events": clips, "delays": np.array(delays)}
+    for name in LESIONS:
+        arrays[f"H_{name}"] = np.stack([p[name]["H"] for p in per])        # (n_trials, n_delays, 361)
+        arrays[f"s_{name}"] = np.stack([p[name]["s"] for p in per])
+    return arrays
+
+
+def retention_key(cfg, delays) -> str:
+    return hashlib.sha256((repr(cfg) + f"|retention|{tuple(delays)}").encode()).hexdigest()[:16]
+
+
+def get_retention_arrays(seed: int, n_trials: int, delays=DELAYS, cache_dir=None, verbose: bool = False):
+    """(arrays, from_cache); a stale or missing cache entry is rebuilt, never reused."""
+    cfg_full, cfg_ring = rand_arm_config("FULL", seed, n_trials), rand_arm_config("RING_ONLY", seed, n_trials)
+    path = None
+    if cache_dir is not None:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        path = Path(cache_dir) / f"retention_seed{seed}_n{n_trials}.npz"
+        if path.exists():
+            with np.load(path, allow_pickle=False) as z:
+                if str(z["key"]) == retention_key(cfg_full, delays):
+                    return {k: (z[k] if z[k].ndim else float(z[k])) for k in z.files if k != "key"}, True
+            if verbose:
+                print(f"    [cache] stale entry for seed {seed}: rebuilding", flush=True)
+    arrays = build_retention_arrays(cfg_full, cfg_ring, delays, verbose)
+    if path is not None:
+        np.savez(path, key=retention_key(cfg_full, delays), **arrays)
+    return arrays, False
+
+
+def mod_features(arrays: dict, lesion: str, j: int, medium) -> np.ndarray:
+    """slow_mod * s + holo_mod * H at delay index ``j`` (the quantity the probe couples to)."""
+    return medium.slow_mod * arrays[f"s_{lesion}"][:, j] + medium.holo_mod * arrays[f"H_{lesion}"][:, j]
+
+
+# ------------------------------------------------------------------- verdict
+def best_r2(sres: dict, lesion: str, delay, mult: str) -> tuple[float, str]:
+    """(best R2 over readouts, counted only if its interval versus NULL is above 0; readout)."""
+    cells = sres["cells"][lesion][str(delay)][mult]
+    r = max(cells, key=lambda k: cells[k]["r2"])
+    c = cells[r]
+    return (c["r2"] if c["diff_vs_null"]["lo"] > 0 else 0.0), r
+
+
+def half_life(sres: dict, lesion: str, mult: str = PRIMARY_MULT):
+    """Delay at which the best R2 first falls below half of its delay-0 value (linear interpolation);
+    ``">T"`` if it never does within the sweep, None if the delay-0 value is below MIN_R2.  Descriptive."""
+    ds = sorted(int(d) for d in sres["cells"][lesion])
+    vals = [max(c["r2"] for c in sres["cells"][lesion][str(d)][mult].values()) for d in ds]
+    if vals[0] < MIN_R2:
+        return None
+    half = vals[0] / 2.0
+    for (d1, v1), (d2, v2) in zip(zip(ds, vals), zip(ds[1:], vals[1:])):
+        if v2 < half <= v1:
+            return float(d1 + (v1 - half) / (v1 - v2) * (d2 - d1))
+    return f">{ds[-1]}"
+
+
+def verdict(sres: dict, mult: str = PRIMARY_MULT) -> dict:
+    """Pre-registered decision rule (fixed before the reported runs), applied per seed.
+
+    0. INVALID_CLIPPED          the safety clip fired.
+    -  INCONCLUSIVE             HOLO or SLOW missing.
+    1. POSITIVE_CONTROL_FAILS   Fourier features do not decode the descriptors (R2 < 0.95).
+    2. CONTROL_FAILS            NULL (noise only) has R2 > 0.05 anywhere: a leak.
+    3. STATE_CONTROL_FAILS      the pooled written map does not decode placement (R2 < 0.25).
+    With h(t), s(t) the best R2 (counted only if the interval versus NULL is above 0) of HOLO and SLOW at
+    delay t and T the longest delay:
+    4. HOLO_NEVER_ABOVE_FLOOR    h(t) < 0.10 at every delay: the hologram's part never rises above the noise.
+    5. PLASTICITY_EXTENDS_MEMORY h(T) >= 0.10 AND HOLO beats SLOW at T (paired interval of the difference,
+                                 for HOLO's best readout, above 0).
+       SLOW_PERSISTS             otherwise, s(T) >= 0.10: the slow field is the longer memory.
+       BOTH_FADE                 otherwise.
+    Half-lives (delay at which R2 halves) are reported as a descriptive statistic.
+    """
+    if sres["clip_events"] > 0:
+        return {"outcome": "INVALID_CLIPPED", "text": "Safety clip fired.", "next": "Lower the drive and rerun."}
+    if "HOLO" not in sres["cells"] or "SLOW" not in sres["cells"]:
+        return {"outcome": "INCONCLUSIVE", "text": "Needs HOLO and SLOW.", "next": "Run with both."}
+    pc = sres["baselines"]["fft_concat"]["shape"]["linear"]["r2"]
+    if pc < POSITIVE_CONTROL_R2:
+        return {"outcome": "POSITIVE_CONTROL_FAILS", "text": f"Fourier features decode with R2 = {pc:.3f} < {POSITIVE_CONTROL_R2}.",
+                "next": "Fix the target construction first."}
+    leaks = [(m, r) for m, d in sres["null"].items() for r, c in d.items() if c["r2"] > 0.05]
+    if leaks:
+        return {"outcome": "CONTROL_FAILS", "text": f"NULL (noise only) has R2 > 0.05 for {leaks[:3]}: a leak.",
+                "next": "Find and remove the leaking channel first."}
+    mp = max(c["r2"] for c in sres["baselines"]["map"]["position"].values())
+    if mp < STATE_CONTROL_MIN:
+        return {"outcome": "STATE_CONTROL_FAILS", "text": f"The pooled written map decodes placement with R2 = {mp:.2f} < {STATE_CONTROL_MIN}.",
+                "next": "Fix the pipeline first."}
+    ds = sorted(int(d) for d in sres["cells"]["HOLO"])
+    T = ds[-1]
+    h = {d: best_r2(sres, "HOLO", d, mult)[0] for d in ds}
+    s = {d: best_r2(sres, "SLOW", d, mult)[0] for d in ds}
+    hl = {n: half_life(sres, n, mult) for n in DECODED if n in sres["cells"]}
+    tail = (f" HOLO R2 by delay: {', '.join(f'{d}: {h[d]:.2f}' for d in ds)}; SLOW: {', '.join(f'{d}: {s[d]:.2f}' for d in ds)}. "
+            f"Half-lives: {hl}.")
+    base = {"half_lives": hl}
+    if max(h.values()) < MIN_R2:
+        return {"outcome": "HOLO_NEVER_ABOVE_FLOOR", **base,
+                "text": f"The hologram's part never reaches R2 {MIN_R2} at noise x{mult}." + tail,
+                "next": "The write rule stores too little to survive this noise; redesign it (for example a reference-beam hologram)."}
+    r = best_r2(sres, "HOLO", T, mult)[1]
+    beats = sres["hs"][str(T)][mult][r]["lo"] > 0
+    if h[T] >= MIN_R2 and beats:
+        return {"outcome": "PLASTICITY_EXTENDS_MEMORY", **base,
+                "text": f"At delay {T} the hologram's part decodes (R2 = {h[T]:.2f}) and beats the slow field (paired interval above 0)." + tail,
+                "next": "Plasticity extends memory beyond the field; make the hologram readable (probe design) and re-test."}
+    if s[T] >= MIN_R2:
+        return {"outcome": "SLOW_PERSISTS", **base,
+                "text": f"At delay {T} the slow field still decodes (R2 = {s[T]:.2f}) and the hologram does not beat it." + tail,
+                "next": "The slow field is the longer memory in this design; examine its decay law and what it stores."}
+    return {"outcome": "BOTH_FADE", **base,
+            "text": f"Neither the hologram's part nor the slow field decodes at delay {T}." + tail,
+            "next": "Memory is short-lived here; strengthen the write or redesign the plastic rule."}
+
+
+# ------------------------------------------------------------------- the study
+def run_retention(n_trials: int = 240, seeds=(0, 1), delays=DELAYS, readouts=DECODE_READOUTS, mults=MULTS,
+                  cache_dir=None, n_boot: int = 2000, k: int = 5, repeats: int = 3, verbose: bool = True) -> dict:
+    t0 = time.time()
+    basis = shape_basis()
+    res = {"config": {"n_trials": n_trials, "seeds": list(seeds), "delays": list(delays), "readouts": list(readouts),
+                      "mults": list(mults), "n_boot": n_boot}, "seeds": {}}
+    for seed in seeds:
+        cfg = rand_arm_config("FULL", seed, n_trials)
+        Y = shape_targets(cfg, basis)
+        arrays, _ = get_retention_arrays(seed, n_trials, delays, cache_dir, verbose)
+        medium = cfg.base.medium
+        zero = np.zeros((n_trials, arrays["H_HOLO"].shape[2]))
+        level_null = 1.0 - 0.05 / (len(DECODED) * len(readouts))
+        level_hs = 1.0 - 0.05 / len(readouts)
+        E_null = {(str(m), r): squared_errors(add_noise(zero, m, seed, mi), Y, make_regressor(r), k, repeats, seed)
+                  for mi, m in enumerate(mults) for r in readouts}
+        E = {}
+        for name in DECODED:
+            for j, d in enumerate(delays):
+                X = mod_features(arrays, name, j, medium)
+                for mi, m in enumerate(mults):
+                    Xn = add_noise(X, m, seed, mi)
+                    for r in readouts:
+                        E[(name, str(d), str(m), r)] = squared_errors(Xn, Y, make_regressor(r), k, repeats, seed)
+        sres = {"cells": {}, "null": {}, "hs": {}, "baselines": {}, "delays": list(delays),
+                "clip_events": float(arrays["clip_events"])}
+        for m in mults:
+            sres["null"][str(m)] = {r: {"r2": bootstrap_r2(E_null[(str(m), r)], Y, n_boot=n_boot, seed=seed)["point"]} for r in readouts}
+        for name in DECODED:
+            sres["cells"][name] = {}
+            for d in delays:
+                sres["cells"][name][str(d)] = {}
+                for m in mults:
+                    sres["cells"][name][str(d)][str(m)] = {}
+                    for r in readouts:
+                        Ea = E[(name, str(d), str(m), r)]
+                        ci = bootstrap_r2(Ea, Y, n_boot=n_boot, seed=seed)
+                        dn = bootstrap_r2(Ea, Y, E_null[(str(m), r)], n_boot, seed, level_null)
+                        sres["cells"][name][str(d)][str(m)][r] = {
+                            "r2": ci["point"], "r2_lo": ci["lo"], "r2_hi": ci["hi"],
+                            "diff_vs_null": {"diff": dn["point"], "lo": dn["lo"], "hi": dn["hi"]},
+                            "per_output": [float(x) for x in r2_per_output(Ea, Y)]}
+        for d in delays:
+            sres["hs"][str(d)] = {str(m): {r: bootstrap_r2(E[("HOLO", str(d), str(m), r)], Y, E[("SLOW", str(d), str(m), r)],
+                                                            n_boot, seed, level_hs) for r in readouts} for m in mults}
+        raw, _ = build_rand_raw(cfg)
+        P = position_targets(cfg)
+        sres["baselines"]["fft_concat"] = {"shape": {r: {"r2": bootstrap_r2(squared_errors(BASELINE_SETS["fft_concat"](raw), Y, make_regressor(r), k, repeats, seed), Y, n_boot=n_boot, seed=seed)["point"]} for r in readouts}}
+        sres["baselines"]["map"] = {"position": {r: {"r2": bootstrap_r2(squared_errors(build_written_maps(cfg), P, make_regressor(r), k, repeats, seed), P, n_boot=n_boot, seed=seed)["point"]} for r in readouts}}
+        primary = PRIMARY_MULT if PRIMARY_MULT in {str(m) for m in mults} else str(mults[0])
+        sres["verdict"] = verdict(sres, primary)
+        sres["verdict_at"] = {str(m): verdict(sres, str(m))["outcome"] for m in mults}
+        res["seeds"][seed] = sres
+        if verbose:
+            print(f"[seed {seed}] {sres['verdict']['outcome']}: {sres['verdict']['text'][:200]}", flush=True)
+    res["combined"] = combine_verdicts({s: r["verdict"] for s, r in res["seeds"].items()})
+    res["seconds"] = time.time() - t0
+    return res
+
+
+def format_report(res: dict) -> str:
+    c = res["config"]
+    rd = c["readouts"]
+    lines = [f"WaveBrain retention of the stored state (trials={c['n_trials']}, seeds={c['seeds']}, delays={c['delays']}, "
+             f"readout noise = multiple of the sensor noise 0.015; STATE level, no probe)"]
+    for seed, s in res["seeds"].items():
+        for m in c["mults"]:
+            lines += ["", f"=== seed {seed}, noise x{m}: shape R2 [95% CI] of the modulation map by delay ===",
+                      f"{'lesion / delay':<18}" + "".join(f"{r:>24}" for r in rd), "-" * (18 + 24 * len(rd))]
+            for n in DECODED:
+                for d in c["delays"]:
+                    cells = s["cells"][n][str(d)][str(m)]
+                    lines.append(f"{n + ' ' + str(d):<18}" + "".join(
+                        f"{cells[r]['r2']:+.2f} [{cells[r]['r2_lo']:+.2f},{cells[r]['r2_hi']:+.2f}]".rjust(24) for r in rd))
+            lines.append(f"{'NULL (noise only)':<18}" + "".join(f"{s['null'][str(m)][r]['r2']:+.2f}".rjust(24) for r in rd))
+        T = str(c["delays"][-1])
+        lines += ["", f"HOLO minus SLOW at delay {T} [paired CI]: " + "  ".join(
+            f"x{m} {r} {s['hs'][T][str(m)][r]['point']:+.3f} [{s['hs'][T][str(m)][r]['lo']:+.3f},{s['hs'][T][str(m)][r]['hi']:+.3f}]"
+            for m in c["mults"] for r in rd)]
+        lines.append("controls: Fourier features shape R2 "
+                     f"{s['baselines']['fft_concat']['shape']['linear']['r2']:+.3f}; pooled written map placement R2 "
+                     f"{max(v['r2'] for v in s['baselines']['map']['position'].values()):+.2f}")
+        v = s["verdict"]
+        lines += ["", f"VERDICT (seed {seed}, noise x{PRIMARY_MULT}): {v['outcome']}", f"  {v['text']}", f"  Next: {v['next']}",
+                  f"  outcome at each noise level: {s['verdict_at']}"]
+    lines += ["", f"COMBINED: {res['combined']['outcome']}  (per seed: {res['combined']['per_seed']})"]
+    return "\n".join(lines)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--trials", type=int, default=240)
+    ap.add_argument("--seeds", default="0,1")
+    ap.add_argument("--delays", default=",".join(str(d) for d in DELAYS))
+    ap.add_argument("--mults", default=",".join(str(m) for m in MULTS),
+                    help="readout-noise multipliers; 0.0 = no noise (exploratory: does the information itself decay?)")
+    ap.add_argument("--cache", default=None, help="directory for the cached retention arrays")
+    ap.add_argument("--boot", type=int, default=2000)
+    ap.add_argument("--json", default=None)
+    a = ap.parse_args(argv)
+    res = run_retention(a.trials, tuple(int(x) for x in a.seeds.split(",")), tuple(int(x) for x in a.delays.split(",")),
+                        mults=tuple(float(x) for x in a.mults.split(",")), cache_dir=a.cache, n_boot=a.boot)
+    print("\n" + format_report(res) + f"\n\n(total {res['seconds']:.0f}s)")
+    if a.json:
+        def stringify(o):
+            return {str(k): stringify(v) for k, v in o.items()} if isinstance(o, dict) else o
+        with open(a.json, "w") as fh:
+            json.dump(strip_private(stringify(res)), fh, indent=2)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+python3 -c "import wavebrain.retention as r; print('retention imports ok; lesions:', list(r.LESIONS))"
+
+Response:
+
+{"returncode":0,"stdout":"retention imports ok; lesions: ['HOLO', 'HOLO_SLOW', 'SLOW']\n","stderr":""}
