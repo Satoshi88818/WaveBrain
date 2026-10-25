@@ -1,0 +1,49 @@
+cd /home/squire/wavebrain_project; cp retention_results.json /tmp/retention_results_first.json; cp retention_output.txt /tmp/retention_output_first.txt
+python3 - << 'EOF'
+def sub(s, old, new):
+    assert old in s, f"missing: {old[:70]}"
+    return s.replace(old, new, 1)
+p='wavebrain/retention.py'; s=open(p).read()
+s=sub(s,'''        sres["verdict"] = verdict(sres)
+        sres["verdict_at"] = {str(m): verdict(sres, str(m))["outcome"] for m in mults}''','''        primary = PRIMARY_MULT if PRIMARY_MULT in {str(m) for m in mults} else str(mults[0])
+        sres["verdict"] = verdict(sres, primary)
+        sres["verdict_at"] = {str(m): verdict(sres, str(m))["outcome"] for m in mults}''')
+s=sub(s,'''    ap.add_argument("--cache", default=None, help="directory for the cached retention arrays")''','''    ap.add_argument("--mults", default=",".join(str(m) for m in MULTS),
+                    help="readout-noise multipliers; 0.0 = no noise (exploratory: does the information itself decay?)")
+    ap.add_argument("--cache", default=None, help="directory for the cached retention arrays")''')
+s=sub(s,'''                        cache_dir=a.cache, n_boot=a.boot)''','''                        mults=tuple(float(x) for x in a.mults.split(",")), cache_dir=a.cache, n_boot=a.boot)''')
+open(p,'w').write(s)
+t='tests/test_retention.py'; s=open(t).read()
+s=sub(s,'''def test_report_and_cli(tiny, tmp_path):''','''def test_noise_free_run_and_the_mults_option(tiny, tmp_path):
+    res, kw, cache = tiny
+    nf = run_retention(**{**kw, "mults": (0.0,)})
+    s = nf["seeds"][3]
+    assert set(s["verdict_at"]) == {"0.0"} and s["verdict"]["outcome"] in {
+        "HOLO_NEVER_ABOVE_FLOOR", "PLASTICITY_EXTENDS_MEMORY", "SLOW_PERSISTS", "BOTH_FADE"}   # primary falls back to 0.0
+    assert set(s["cells"]["HOLO"]["0"]) == {"0.0"} and all(v["r2"] < 0.2 for v in s["null"]["0.0"].values())
+    out = tmp_path / "nf.json"
+    assert main(["--trials", "24", "--seeds", "3", "--delays", "0,100", "--mults", "0.0", "--cache", str(cache),
+                 "--boot", "50", "--json", str(out)]) == 0
+    assert json.loads(out.read_text())["config"]["mults"] == [0.0]
+
+
+def test_report_and_cli(tiny, tmp_path):''')
+open(t,'w').write(s)
+EOF
+python3 -m pytest tests/test_retention.py 2>&1 | tail -3
+md5sum wavebrain/*.py > /tmp/code_at_retention_final2.txt
+python3 -m wavebrain.retention --trials 240 --seeds 0,1 --cache /home/squire/cache_ret_final --boot 2000 --json retention_results.json > retention_output.txt 2>&1
+python3 - << 'EOF'
+import json
+a=json.load(open('/tmp/retention_results_first.json')); b=json.load(open('retention_results.json'))
+def strip(d):
+    if isinstance(d,dict): return {k:strip(v) for k,v in d.items() if k!="seconds"}
+    return d
+print("reported results identical after the code change (excluding runtime):", strip(a)==strip(b))
+EOF
+python3 -m wavebrain.retention --trials 240 --seeds 0,1 --mults 0.0 --cache /home/squire/cache_ret_final --boot 2000 --json retention_noisefree_results.json > retention_noisefree_output.txt 2>&1
+sed -n '/^WaveBrain retention/,$p' retention_noisefree_output.txt | grep -v "^$" | grep -E "^(HOLO|HOLO_SLOW|SLOW|NULL)|=== seed|VERDICT|HOLO minus" | cut -c1-150
+
+Response:
+
+{"returncode":0,"stdout":"=========================== short test summary info ============================\nFAILED tests/test_retention.py::test_noise_free_run_and_the_mults_option - As...\n1 failed, 15 passed in 10.15s\nreported results identical after the code change (excluding runtime): True\n=== seed 0, noise x0.0: shape R2 [95% CI] of the modulation map by delay ===\nHOLO 0                 -0.73 [-0.91,-0.59]     +0.34 [+0.28,+0.39]\nHOLO 250               -0.73 [-0.91,-0.59]     +0.34 [+0.28,+0.39]\nHOLO 500               -0.73 [-0.91,-0.59]     +0.34 [+0.28,+0.39]\nHOLO 1000              -0.73 [-0.91,-0.59]     +0.34 [+0.28,+0.39]\nHOLO 2000              -0.73 [-0.91,-0.59]     +0.34 [+0.28,+0.39]\nHOLO_SLOW 0            -0.89 [-1.08,-0.73]     +0.52 [+0.48,+0.55]\nHOLO_SLOW 250          +0.49 [+0.45,+0.52]     +0.49 [+0.46,+0.52]\nHOLO_SLOW 500          +0.50 [+0.46,+0.53]     +0.49 [+0.46,+0.52]\nHOLO_SLOW 1000         +0.46 [+0.42,+0.50]     +0.45 [+0.41,+0.48]\nHOLO_SLOW 2000         +0.35 [+0.29,+0.39]     +0.34 [+0.29,+0.38]\nSLOW 0                 -0.64 [-0.87,-0.46]     +0.52 [+0.49,+0.55]\nSLOW 250               +0.50 [+0.46,+0.53]     +0.51 [+0.47,+0.54]\nSLOW 500               +0.51 [+0.47,+0.54]     +0.52 [+0.48,+0.55]\nSLOW 1000              +0.51 [+0.47,+0.54]     +0.50 [+0.47,+0.53]\nSLOW 2000              +0.51 [+0.47,+0.54]     +0.42 [+0.38,+0.45]\nNULL (noise only)                    -0.01                   -0.01\nHOLO minus SLOW at delay 2000 [paired CI]: x0.0 linear -1.239 [-1.440,-1.077]  x0.0 rbf -0.080 [-0.141,-0.022]\nVERDICT (seed 0, noise x1.0): SLOW_PERSISTS\n=== seed 1, noise x0.0: shape R2 [95% CI] of the modulation map by delay ===\nHOLO 0                 -0.86 [-1.09,-0.69]     +0.36 [+0.30,+0.41]\nHOLO 250               -0.86 [-1.09,-0.69]     +0.36 [+0.30,+0.41]\nHOLO 500               -0.86 [-1.09,-0.69]     +0.36 [+0.30,+0.41]\nHOLO 1000              -0.86 [-1.09,-0.69]     +0.36 [+0.30,+0.41]\nHOLO 2000              -0.86 [-1.09,-0.69]     +0.36 [+0.30,+0.41]\nHOLO_SLOW 0            -0.75 [-0.91,-0.60]     +0.50 [+0.46,+0.53]\nHOLO_SLOW 250          +0.45 [+0.41,+0.49]     +0.45 [+0.41,+0.49]\nHOLO_SLOW 500          +0.47 [+0.44,+0.50]     +0.46 [+0.42,+0.49]\nHOLO_SLOW 1000         +0.44 [+0.40,+0.48]     +0.43 [+0.39,+0.46]\nHOLO_SLOW 2000         +0.36 [+0.31,+0.40]     +0.34 [+0.30,+0.38]\nSLOW 0                 -0.65 [-0.82,-0.51]     +0.51 [+0.48,+0.54]\nSLOW 250               +0.49 [+0.45,+0.52]     +0.48 [+0.45,+0.51]\nSLOW 500               +0.49 [+0.46,+0.52]     +0.50 [+0.47,+0.53]\nSLOW 1000              +0.50 [+0.46,+0.52]     +0.47 [+0.44,+0.50]\nSLOW 2000              +0.49 [+0.46,+0.52]     +0.37 [+0.31,+0.41]\nNULL (noise only)                    -0.01                   -0.01\nHOLO minus SLOW at delay 2000 [paired CI]: x0.0 linear -1.352 [-1.605,-1.160]  x0.0 rbf -0.009 [-0.081,+0.071]\nVERDICT (seed 1, noise x1.0): SLOW_PERSISTS\n","stderr":""}
